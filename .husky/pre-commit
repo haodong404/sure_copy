@@ -1,0 +1,16 @@
+#!/usr/bin/env sh
+
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ -z "$staged_files" ]; then
+	exit 0
+fi
+
+biome_files=$(printf "%s\n" "$staged_files" | grep -E '\.(js|jsx|ts|tsx|json|jsonc|css|graphql|md|yaml|yml)$' || true)
+
+if [ -z "$biome_files" ]; then
+	echo "No Biome-supported staged files, skipping Biome check."
+	exit 0
+fi
+
+printf "%s\n" "$biome_files" | tr '\n' '\0' | xargs -0 bunx --no-install biome check --files-ignore-unknown=true

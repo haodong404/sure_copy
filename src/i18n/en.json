@@ -1,0 +1,7 @@
+{
+  "hello": "Hello",
+  "greet": {
+    "morning": "Good morning",
+    "evening": "Good evening"
+  }
+}
