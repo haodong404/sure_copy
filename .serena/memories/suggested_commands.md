@@ -1,0 +1,12 @@
+Useful commands on this Darwin workspace:
+- `git status -sb`
+- `rg --files`
+- `rg -n "pattern" sure_copy_core/src`
+- `cargo test -p sure_copy_core`
+- `cargo test --workspace`
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `npm run dev`
+- `npm run build`
+- `cargo tauri dev` or `npm run tauri -- dev` (if Tauri CLI is installed)
+- `ls`, `find`, `cd`, `sed -n 'start,endp' file`, `nl -ba file | sed -n 'start,endp'`

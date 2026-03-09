@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::pipeline::TaskPipelinePlan;
 
@@ -14,7 +14,7 @@ fn available_cpu_parallelism() -> usize {
 pub type CopyTaskId = String;
 
 /// Lifecycle states for a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskState {
     Created,
     Planned,
@@ -32,7 +32,9 @@ impl TaskState {
 
         match (self, next) {
             (Created, Planned) => true,
+            (Created, Cancelled) => true,
             (Planned, Running) => true,
+            (Planned, Cancelled) => true,
             (Running, Completed | Failed | Cancelled | Paused) => true,
             (Paused, Running | Cancelled) => true,
             // Self-transition can simplify idempotent orchestration calls.
@@ -43,7 +45,7 @@ impl TaskState {
 }
 
 /// Overwrite behavior for destination conflicts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OverwritePolicy {
     Skip,
     Overwrite,
@@ -52,7 +54,7 @@ pub enum OverwritePolicy {
 }
 
 /// Verification strategy after write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerificationPolicy {
     None,
     PostCopy,
@@ -60,7 +62,7 @@ pub enum VerificationPolicy {
 }
 
 /// Retry behavior for retryable failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetryPolicy {
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
@@ -78,7 +80,7 @@ impl Default for RetryPolicy {
 }
 
 /// Tunable options for one task.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskOptions {
     pub overwrite_policy: OverwritePolicy,
     pub verification_policy: VerificationPolicy,
@@ -113,8 +115,26 @@ impl Default for TaskOptions {
     }
 }
 
+/// Immutable submission spec that can be durably persisted and reloaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskSpec {
+    pub source_root: PathBuf,
+    pub destinations: Vec<PathBuf>,
+    pub options: TaskOptions,
+}
+
+impl TaskSpec {
+    pub fn new(source_root: PathBuf, destinations: Vec<PathBuf>, options: TaskOptions) -> Self {
+        Self {
+            source_root,
+            destinations,
+            options,
+        }
+    }
+}
+
 /// Planned work for one source file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilePlan {
     pub source: PathBuf,
     pub destinations: Vec<PathBuf>,
@@ -143,14 +163,28 @@ impl CopyTask {
         destinations: Vec<PathBuf>,
         options: TaskOptions,
     ) -> Self {
+        Self::from_spec(id, TaskSpec::new(source_root, destinations, options))
+    }
+
+    /// Creates a task from an immutable submission spec.
+    pub fn from_spec(id: impl Into<CopyTaskId>, spec: TaskSpec) -> Self {
         Self {
             id: id.into(),
-            source_root,
-            destinations,
-            options,
+            source_root: spec.source_root,
+            destinations: spec.destinations,
+            options: spec.options,
             pipelines: TaskPipelinePlan::default(),
             state: TaskState::Created,
             file_plans: Vec::new(),
+        }
+    }
+
+    /// Returns the immutable submission spec for persistence/recovery.
+    pub fn spec(&self) -> TaskSpec {
+        TaskSpec {
+            source_root: self.source_root.clone(),
+            destinations: self.destinations.clone(),
+            options: self.options.clone(),
         }
     }
 
@@ -248,10 +282,14 @@ pub struct TaskTemplate {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
     #[test]
     fn state_machine_allows_expected_paths() {
         assert!(TaskState::Created.can_transition_to(TaskState::Planned));
+        assert!(TaskState::Created.can_transition_to(TaskState::Cancelled));
         assert!(TaskState::Planned.can_transition_to(TaskState::Running));
+        assert!(TaskState::Planned.can_transition_to(TaskState::Cancelled));
         assert!(TaskState::Running.can_transition_to(TaskState::Paused));
         assert!(TaskState::Paused.can_transition_to(TaskState::Running));
         assert!(TaskState::Running.can_transition_to(TaskState::Completed));
@@ -280,5 +318,68 @@ mod tests {
         assert_eq!(err.category, CopyErrorCategory::NotImplemented);
         assert_eq!(err.code, "NOT_IMPLEMENTED");
         assert!(err.message.contains("TaskOrchestrator::start"));
+    }
+
+    #[test]
+    fn state_machine_allows_self_transition_for_all_states() {
+        let all_states = [
+            TaskState::Created,
+            TaskState::Planned,
+            TaskState::Running,
+            TaskState::Completed,
+            TaskState::Failed,
+            TaskState::Cancelled,
+            TaskState::Paused,
+        ];
+
+        for state in all_states {
+            assert!(state.can_transition_to(state));
+        }
+    }
+
+    #[test]
+    fn retry_policy_default_values_are_stable() {
+        let retry = RetryPolicy::default();
+        assert_eq!(retry.max_retries, 3);
+        assert_eq!(retry.initial_backoff_ms, 200);
+        assert_eq!(retry.exponential_factor, 2);
+    }
+
+    #[test]
+    fn copy_task_new_initializes_runtime_managed_defaults() {
+        let task = CopyTask::new(
+            "task-123",
+            PathBuf::from("/source"),
+            vec![PathBuf::from("/dest-a"), PathBuf::from("/dest-b")],
+            TaskOptions::default(),
+        );
+
+        assert_eq!(task.id, "task-123");
+        assert_eq!(task.state, TaskState::Created);
+        assert!(task.file_plans.is_empty());
+        assert!(task.pipelines.pre_copy_pipeline.is_none());
+        assert!(task.pipelines.post_copy_pipeline.is_none());
+    }
+
+    #[test]
+    fn copy_task_builder_methods_override_fields() {
+        let file_plans = vec![FilePlan {
+            source: PathBuf::from("/src/file.txt"),
+            destinations: vec![PathBuf::from("/dst/file.txt")],
+            expected_size_bytes: Some(12),
+            expected_checksum: Some("abc123".to_string()),
+        }];
+
+        let task = CopyTask::new(
+            "task-456",
+            PathBuf::from("/source"),
+            vec![PathBuf::from("/dest")],
+            TaskOptions::default(),
+        )
+        .with_state(TaskState::Planned)
+        .with_file_plans(file_plans.clone());
+
+        assert_eq!(task.state, TaskState::Planned);
+        assert_eq!(task.file_plans, file_plans);
     }
 }

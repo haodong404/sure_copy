@@ -12,7 +12,7 @@ The core module is responsible for **reliable copying** itself: task orchestrati
 
 1. **Correctness first**: guarantee verifiable copy results with source/destination checks.
 2. **Recoverability**: support resume-after-interruption, retries, and traceable failures.
-3. **Extensibility**: allow pluggable processing stages (compression, encryption, transcoding) without modifying the core flow. There are two kinds of Pipelines: PreCopyProcessingPipeline and PostCopyProcessingPipeline. The former runs while reading the source file and the latter runs after writing to the destination. Both pipelines support mixed serial and parallel stage composition.
+3. **Extensibility**: allow pluggable processing stages (compression, encryption, transcoding) without modifying the core flow. The current runtime keeps pipeline support conservative: serial stage chains are the supported execution model today, while concurrent topologies remain future work.
 4. **Observability**: provide a unified event stream and structured reports for GUI display and auditing.
 5. **Controllable performance**: make concurrency, buffering, and I/O policies configurable with sensible limits.
 
@@ -28,14 +28,12 @@ The core module is responsible for **reliable copying** itself: task orchestrati
    - Coordinates multi-task concurrency and resource quotas (threads, bandwidth, file handles).
 
 3. **Pipeline Layer**
-   - Executes two unified flows:
-     Start -> Read -> Write -> (optional) PostCopyProcessingPipeline -> End
-                   -> (optional) PreProcessingPipeline -> End 
-   - Supports mixed serial/parallel stage composition.
+   - Defines stage contracts and serial streaming composition.
+   - Keeps topology modeling separate from the durable SQLite task runtime.
    - Enforces a consistent stage contract for easy plug-in integration.
 
 4. **Infrastructure Layer**
-   - Provides filesystem adapters, checksum implementations, persisted runtime state (for resume), logging, and time services.
+   - Provides filesystem adapters and checksum implementations used by the runtime.
    - Isolates platform differences (Windows/macOS/Linux path and permission behavior).
 
 5. **Interface Layer**
@@ -71,8 +69,8 @@ The core module is responsible for **reliable copying** itself: task orchestrati
 
 6. **Linked Stream**
    - Models processing steps as `Stage` units (compression, encryption, transformation, masking).
-   - Each `Stage` declares capabilities (parallelizable, output-size changing, reversible).
-   - The core engine stays stage-agnostic and only handles topology execution and rollback semantics.
+   - Current runtime support is a serial stream handoff between stages.
+   - The core engine stays stage-agnostic and can grow stricter topology support later.
 
 ### Task Lifecycle (Recommended State Machine)
 
@@ -119,7 +117,7 @@ This section documents the current `sure_copy_core` API shape to keep code and d
 
 - Use `CopyTask::new(...)` for safe defaults.
 - Override pipelines with `.with_pipelines(...)`.
-- Default pre-copy mode is `PreCopyPipelineMode::ConcurrentWithCopy`.
+- Default pre-copy mode is `PreCopyPipelineMode::SerialBeforeCopy`.
 
 Conceptual example:
 
