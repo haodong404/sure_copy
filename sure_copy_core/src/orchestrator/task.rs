@@ -12,7 +12,7 @@ use super::errors::{invalid_state_error, lock_poisoned_error};
 pub type TaskStream = broadcast::Receiver<TaskUpdate>;
 
 /// Realtime task updates for UI observers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskUpdate {
     Progress(TaskProgress),
     State(TaskState),
@@ -83,10 +83,14 @@ impl InMemoryTask {
             .write()
             .map_err(|_| lock_poisoned_error("InMemoryTask::set_progress"))?;
         debug!(
-            "task '{}' progress updated to {}/{} bytes",
-            self.id, progress.complete_bytes, progress.total_bytes
+            "task '{}' progress updated to {}/{} bytes ({} active transfers, {} stages)",
+            self.id,
+            progress.complete_bytes,
+            progress.total_bytes,
+            progress.active_transfers.len(),
+            progress.stage_progresses.len()
         );
-        runtime.progress = progress;
+        runtime.progress = progress.clone();
         runtime.report = None;
         let _ = self.event_tx.send(TaskUpdate::Progress(progress));
         Ok(())
@@ -216,7 +220,7 @@ impl Task for InMemoryTask {
             .runtime
             .read()
             .map_err(|_| lock_poisoned_error("InMemoryTask::progress"))?;
-        Ok(runtime.progress)
+        Ok(runtime.progress.clone())
     }
 
     fn subscribe(&self) -> Result<TaskStream, CopyError> {

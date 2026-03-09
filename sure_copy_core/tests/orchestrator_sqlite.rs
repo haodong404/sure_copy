@@ -2,7 +2,6 @@ mod common;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use sqlx::Row;
@@ -10,9 +9,8 @@ use sure_copy_core::pipeline::{
     SourceObserverPipeline, SourceObserverStage, SourcePipelineMode, StageId, TaskFlowPlan,
 };
 use sure_copy_core::{
-    CopyError, CopyTask, DestinationCopyStatus, DestinationPostWriteStatus, OrchestratorConfig,
-    OverwritePolicy, PostWritePipelineMode, SqliteTaskOrchestrator, TaskOptions, TaskOrchestrator,
-    TaskState, VerificationPolicy,
+    CopyError, CopyTask, OrchestratorConfig, PostWritePipelineMode, SqliteTaskOrchestrator,
+    TaskOptions, TaskOrchestrator, TaskState, VerificationPolicy,
 };
 
 use common::{init_test_logging, unique_temp_dir, unique_temp_file};
@@ -22,10 +20,6 @@ fn write_text(path: &Path, text: &str) {
         std::fs::create_dir_all(parent).expect("parent directory should be creatable");
     }
     std::fs::write(path, text).expect("file should be writable");
-}
-
-fn read_text(path: &Path) -> String {
-    std::fs::read_to_string(path).expect("file should be readable")
 }
 
 async fn new_orchestrator(db_path: &Path) -> SqliteTaskOrchestrator {
@@ -223,110 +217,6 @@ async fn sqlite_recovery_resets_writing_and_post_write_statuses() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_run_fan_out_copies_to_multiple_destinations() {
-    init_test_logging();
-    let db_path = unique_temp_file("sqlite_fan_out.db");
-    let src_dir = unique_temp_dir("sqlite_fan_out_src");
-    let dst_a = unique_temp_dir("sqlite_fan_out_dst_a");
-    let dst_b = unique_temp_dir("sqlite_fan_out_dst_b");
-    let source_file = src_dir.join("nested").join("hello.txt");
-    write_text(&source_file, "stream me once");
-
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
-
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "fan-out-task",
-            src_dir.clone(),
-            vec![dst_a.clone(), dst_b.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
-
-    assert_eq!(
-        handle.state().await.expect("state should load"),
-        TaskState::Completed
-    );
-    assert_eq!(
-        read_text(&dst_a.join("nested").join("hello.txt")),
-        "stream me once"
-    );
-    assert_eq!(
-        read_text(&dst_b.join("nested").join("hello.txt")),
-        "stream me once"
-    );
-
-    let report = handle.report().await.expect("report should be available");
-    assert_eq!(report.destinations.len(), 2);
-    assert!(report
-        .destinations
-        .iter()
-        .all(|entry| entry.copy_status == DestinationCopyStatus::Succeeded));
-    assert!(report
-        .destinations
-        .iter()
-        .all(|entry| entry.post_write_status == DestinationPostWriteStatus::NotRun));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_run_marks_partial_failed_when_one_destination_branch_errors() {
-    init_test_logging();
-    let db_path = unique_temp_file("sqlite_partial_failed.db");
-    let src_dir = unique_temp_dir("sqlite_partial_failed_src");
-    let good_dst = unique_temp_dir("sqlite_partial_failed_good_dst");
-    let bad_root = unique_temp_file("sqlite_partial_failed_bad_root");
-    write_text(&src_dir.join("hello.txt"), "partial failure");
-    write_text(&bad_root, "not a directory");
-
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
-
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "partial-failed-task",
-            src_dir.clone(),
-            vec![good_dst.clone(), bad_root.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle
-        .run()
-        .await
-        .expect("task should run to a terminal state");
-
-    assert_eq!(
-        handle.state().await.expect("state should load"),
-        TaskState::PartialFailed
-    );
-    assert_eq!(read_text(&good_dst.join("hello.txt")), "partial failure");
-
-    let report = handle.report().await.expect("report should be available");
-    assert_eq!(report.destinations.len(), 2);
-    assert_eq!(
-        report
-            .destinations
-            .iter()
-            .filter(|entry| entry.copy_status == DestinationCopyStatus::Succeeded)
-            .count(),
-        1
-    );
-    assert_eq!(
-        report
-            .destinations
-            .iter()
-            .filter(|entry| entry.copy_status == DestinationCopyStatus::Failed)
-            .count(),
-        1
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_partial_failed_state_persists_across_restart() {
     init_test_logging();
     let db_path = unique_temp_file("sqlite_partial_failed_reload.db");
@@ -366,185 +256,4 @@ async fn sqlite_partial_failed_state_persists_across_restart() {
         reloaded.state().await.expect("reloaded state should load"),
         TaskState::PartialFailed
     );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_skip_policy_is_best_effort_per_destination() {
-    init_test_logging();
-    let db_path = unique_temp_file("sqlite_skip_policy.db");
-    let src_dir = unique_temp_dir("sqlite_skip_policy_src");
-    let dst_a = unique_temp_dir("sqlite_skip_policy_dst_a");
-    let dst_b = unique_temp_dir("sqlite_skip_policy_dst_b");
-    write_text(&src_dir.join("file.txt"), "skip source");
-    write_text(&dst_a.join("file.txt"), "keep me");
-
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
-    options.overwrite_policy = OverwritePolicy::Skip;
-
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "skip-policy-task",
-            src_dir.clone(),
-            vec![dst_a.clone(), dst_b.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
-
-    assert_eq!(
-        handle.state().await.expect("state should load"),
-        TaskState::Completed
-    );
-    assert_eq!(read_text(&dst_a.join("file.txt")), "keep me");
-    assert_eq!(read_text(&dst_b.join("file.txt")), "skip source");
-
-    let report = handle.report().await.expect("report should be available");
-    assert_eq!(
-        report
-            .destinations
-            .iter()
-            .filter(|entry| entry.copy_status == DestinationCopyStatus::Skipped)
-            .count(),
-        1
-    );
-    assert_eq!(
-        report
-            .destinations
-            .iter()
-            .filter(|entry| entry.copy_status == DestinationCopyStatus::Succeeded)
-            .count(),
-        1
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_overwrite_policy_overwrites_each_destination_branch() {
-    init_test_logging();
-    let db_path = unique_temp_file("sqlite_overwrite_policy.db");
-    let src_dir = unique_temp_dir("sqlite_overwrite_policy_src");
-    let dst_a = unique_temp_dir("sqlite_overwrite_policy_dst_a");
-    let dst_b = unique_temp_dir("sqlite_overwrite_policy_dst_b");
-    write_text(&src_dir.join("file.txt"), "overwrite source");
-    write_text(&dst_a.join("file.txt"), "old a");
-    write_text(&dst_b.join("file.txt"), "old b");
-
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
-    options.overwrite_policy = OverwritePolicy::Overwrite;
-
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "overwrite-policy-task",
-            src_dir.clone(),
-            vec![dst_a.clone(), dst_b.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
-
-    assert_eq!(
-        handle.state().await.expect("state should load"),
-        TaskState::Completed
-    );
-    assert_eq!(read_text(&dst_a.join("file.txt")), "overwrite source");
-    assert_eq!(read_text(&dst_b.join("file.txt")), "overwrite source");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_newer_only_policy_decides_per_destination() {
-    init_test_logging();
-    let db_path = unique_temp_file("sqlite_newer_only_policy.db");
-    let src_dir = unique_temp_dir("sqlite_newer_only_policy_src");
-    let dst_old = unique_temp_dir("sqlite_newer_only_policy_dst_old");
-    let dst_new = unique_temp_dir("sqlite_newer_only_policy_dst_new");
-
-    write_text(&dst_old.join("file.txt"), "older target");
-    std::thread::sleep(Duration::from_millis(1100));
-    write_text(&src_dir.join("file.txt"), "newer source");
-    std::thread::sleep(Duration::from_millis(1100));
-    write_text(&dst_new.join("file.txt"), "newer target");
-
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
-    options.overwrite_policy = OverwritePolicy::NewerOnly;
-
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "newer-only-policy-task",
-            src_dir.clone(),
-            vec![dst_old.clone(), dst_new.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
-
-    assert_eq!(
-        handle.state().await.expect("state should load"),
-        TaskState::Completed
-    );
-    assert_eq!(read_text(&dst_old.join("file.txt")), "newer source");
-    assert_eq!(read_text(&dst_new.join("file.txt")), "newer target");
-
-    let report = handle.report().await.expect("report should be available");
-    assert_eq!(
-        report
-            .destinations
-            .iter()
-            .filter(|entry| entry.copy_status == DestinationCopyStatus::Skipped)
-            .count(),
-        1
-    );
-    assert_eq!(
-        report
-            .destinations
-            .iter()
-            .filter(|entry| entry.copy_status == DestinationCopyStatus::Succeeded)
-            .count(),
-        1
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_rename_policy_tracks_actual_destination_path_in_report() {
-    init_test_logging();
-    let db_path = unique_temp_file("sqlite_rename_policy.db");
-    let src_dir = unique_temp_dir("sqlite_rename_policy_src");
-    let dst_dir = unique_temp_dir("sqlite_rename_policy_dst");
-    write_text(&src_dir.join("file.txt"), "rename me");
-    write_text(&dst_dir.join("file.txt"), "existing");
-
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
-    options.overwrite_policy = OverwritePolicy::Rename;
-
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "rename-policy-task",
-            src_dir.clone(),
-            vec![dst_dir.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
-
-    let report = handle.report().await.expect("report should be available");
-    assert_eq!(report.destinations.len(), 1);
-    let destination = &report.destinations[0];
-    let actual = destination
-        .actual_destination_path
-        .clone()
-        .expect("rename policy should record actual destination");
-
-    assert_eq!(destination.destination_path, dst_dir.join("file.txt"));
-    assert_ne!(actual, destination.destination_path);
-    assert_eq!(read_text(&actual), "rename me");
 }

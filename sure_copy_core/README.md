@@ -116,6 +116,30 @@ async fn main() -> Result<(), sure_copy_core::CopyError> {
             TaskUpdate::State(state) => println!("state: {state:?}"),
             TaskUpdate::Progress(progress) => {
                 println!("progress: {}/{}", progress.complete_bytes, progress.total_bytes);
+                for transfer in &progress.active_transfers {
+                    println!(
+                        "copying '{}' -> '{}' ({}/{}) [{:?}]",
+                        transfer.source_path.display(),
+                        transfer
+                            .actual_destination_path
+                            .as_ref()
+                            .unwrap_or(&transfer.destination_path)
+                            .display(),
+                        transfer.bytes_copied,
+                        transfer.expected_bytes,
+                        transfer.phase
+                    );
+                }
+                for stage in &progress.stage_progresses {
+                    println!(
+                        "stage '{}' on '{}' ({}/{:?}) [{:?}]",
+                        stage.stage_id,
+                        stage.source_path.display(),
+                        stage.processed_bytes,
+                        stage.total_bytes,
+                        stage.status
+                    );
+                }
             }
         }
     }

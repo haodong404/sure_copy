@@ -27,6 +27,9 @@ impl SureCopyCoreApi {
     /// Subscribes to realtime updates for one task.
     ///
     /// The returned stream emits `TaskUpdate::State` and `TaskUpdate::Progress`.
+    ///
+    /// `TaskProgress` now includes aggregate byte progress, active file/destination
+    /// transfer details, and pipeline stage progress snapshots.
     pub async fn subscribe(&self, task_id: &str) -> Result<TaskStream, CopyError> {
         let handle = self.task(task_id).await?;
         handle.subscribe()
@@ -77,6 +80,7 @@ mod tests {
             let _ = tx.send(TaskUpdate::Progress(TaskProgress {
                 total_bytes: 100,
                 complete_bytes: 40,
+                ..TaskProgress::default()
             }));
             Ok(rx)
         }
@@ -223,6 +227,7 @@ mod tests {
             TaskUpdate::Progress(TaskProgress {
                 total_bytes: 100,
                 complete_bytes: 40,
+                ..TaskProgress::default()
             })
         );
     }

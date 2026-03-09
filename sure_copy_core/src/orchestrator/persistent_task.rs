@@ -4,6 +4,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use filetime::FileTime;
 use log::{debug, error, info, warn};
 use sqlx::{Row, SqlitePool};
 use tokio::fs::{self, OpenOptions};
@@ -12,9 +13,9 @@ use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 use tokio::task::JoinSet;
 
 use crate::domain::{
-    CopyError, CopyErrorCategory, CopyReport, CopyTask, DestinationCopyStatus,
-    DestinationPostWriteStatus, DestinationReport, FileFailure, FilePlan, OverwritePolicy,
-    TaskProgress, TaskState,
+    ActiveTransferProgress, CopyError, CopyErrorCategory, CopyReport, CopyTask,
+    DestinationCopyStatus, DestinationPostWriteStatus, DestinationReport, FileFailure, FilePlan,
+    OverwritePolicy, StageProgress, StageProgressStatus, TaskProgress, TaskState, TransferPhase,
 };
 use crate::infrastructure::{ChecksumProvider, FileSystem};
 use crate::pipeline::{
@@ -474,7 +475,7 @@ impl PersistentTask {
         Ok(())
     }
 
-    async fn refresh_progress_from_checkpoints(&self) -> Result<(), CopyError> {
+    async fn checkpoint_progress_totals(&self) -> Result<(u64, u64), CopyError> {
         let rows = sqlx::query(
             "SELECT status, bytes_copied, expected_bytes FROM task_file_checkpoints WHERE task_id = ?",
         )
@@ -508,6 +509,133 @@ impl PersistentTask {
             }
         }
 
+        Ok((total_bytes, complete_bytes))
+    }
+
+    fn compose_complete_bytes(
+        total_bytes: u64,
+        base_complete_bytes: u64,
+        active_transfers: &[ActiveTransferProgress],
+    ) -> u64 {
+        let in_flight = active_transfers.iter().fold(0_u64, |acc, transfer| {
+            acc.saturating_add(transfer.bytes_copied.min(transfer.expected_bytes))
+        });
+        base_complete_bytes
+            .saturating_add(in_flight)
+            .min(total_bytes)
+    }
+
+    async fn publish_detailed_progress(
+        &self,
+        total_bytes: u64,
+        base_complete_bytes: u64,
+        mut active_transfers: Vec<ActiveTransferProgress>,
+        mut stage_progresses: Vec<StageProgress>,
+    ) -> Result<(), CopyError> {
+        for transfer in &mut active_transfers {
+            transfer.bytes_copied = transfer.bytes_copied.min(transfer.expected_bytes);
+        }
+
+        for stage in &mut stage_progresses {
+            if let Some(total) = stage.total_bytes {
+                stage.processed_bytes = stage.processed_bytes.min(total);
+            }
+        }
+
+        let complete_bytes =
+            Self::compose_complete_bytes(total_bytes, base_complete_bytes, &active_transfers);
+        let progress = TaskProgress {
+            total_bytes,
+            complete_bytes,
+            active_transfers,
+            stage_progresses,
+        };
+
+        let mut runtime = self
+            .runtime
+            .write()
+            .map_err(|_| lock_poisoned_error("PersistentTask::publish_detailed_progress"))?;
+        runtime.progress = progress.clone();
+        runtime.report = None;
+        let _ = self.event_tx.send(TaskUpdate::Progress(progress));
+        Ok(())
+    }
+
+    fn collect_source_stage_progresses(
+        &self,
+        source: &Path,
+        pipeline: Option<&SourceObserverPipeline>,
+        default_total_bytes: Option<u64>,
+    ) -> Vec<StageProgress> {
+        let Some(pipeline) = pipeline else {
+            return Vec::new();
+        };
+
+        pipeline
+            .stages
+            .iter()
+            .map(|stage| {
+                let progress = stage.progress_state();
+                StageProgress {
+                    stage_id: stage.id().to_string(),
+                    source_path: source.to_path_buf(),
+                    destination_path: None,
+                    processed_bytes: progress
+                        .as_ref()
+                        .map(|state| state.processed_bytes)
+                        .unwrap_or(0),
+                    total_bytes: progress
+                        .as_ref()
+                        .and_then(|state| state.total_bytes)
+                        .or(default_total_bytes),
+                    status: progress
+                        .as_ref()
+                        .map(|state| state.status)
+                        .unwrap_or(StageProgressStatus::Pending),
+                }
+            })
+            .collect()
+    }
+
+    fn collect_post_write_stage_progresses(
+        &self,
+        source: &Path,
+        pipeline: Option<&PostWritePipeline>,
+        default_total_bytes: Option<u64>,
+    ) -> Vec<StageProgress> {
+        let Some(pipeline) = pipeline else {
+            return Vec::new();
+        };
+
+        pipeline
+            .stages
+            .iter()
+            .map(|stage| {
+                let progress = stage.progress_state();
+                StageProgress {
+                    stage_id: stage.id().to_string(),
+                    source_path: source.to_path_buf(),
+                    destination_path: None,
+                    processed_bytes: progress
+                        .as_ref()
+                        .map(|state| state.processed_bytes)
+                        .unwrap_or(0),
+                    total_bytes: progress
+                        .as_ref()
+                        .and_then(|state| state.total_bytes)
+                        .or(default_total_bytes),
+                    status: progress
+                        .as_ref()
+                        .map(|state| state.status)
+                        .unwrap_or(StageProgressStatus::Pending),
+                }
+            })
+            .collect()
+    }
+
+    async fn refresh_progress_from_checkpoints(&self) -> Result<(), CopyError> {
+        let (total_bytes, complete_bytes) = self.checkpoint_progress_totals().await?;
+
         sqlx::query("UPDATE tasks SET total_bytes = ?, complete_bytes = ? WHERE id = ?")
             .bind(total_bytes as i64)
             .bind(complete_bytes as i64)
@@ -521,15 +649,8 @@ impl PersistentTask {
                 )
             })?;
 
-        let mut runtime = self.runtime.write().map_err(|_| {
-            lock_poisoned_error("PersistentTask::refresh_progress_from_checkpoints")
-        })?;
-        runtime.progress = TaskProgress {
-            total_bytes,
-            complete_bytes,
-        };
-        runtime.report = None;
-        let _ = self.event_tx.send(TaskUpdate::Progress(runtime.progress));
+        self.publish_detailed_progress(total_bytes, complete_bytes, Vec::new(), Vec::new())
+            .await?;
         Ok(())
     }
 
@@ -962,12 +1083,95 @@ impl PersistentTask {
         Ok(written)
     }
 
+    async fn preserve_destination_metadata(
+        &self,
+        source: &Path,
+        destination: &Path,
+        options: &crate::domain::TaskOptions,
+    ) -> Result<(), CopyError> {
+        if !options.preserve_permissions && !options.preserve_timestamps {
+            return Ok(());
+        }
+
+        let source_metadata = fs::metadata(source).await.map_err(|err| {
+            io_error(
+                "SOURCE_METADATA_ERROR",
+                format!(
+                    "failed to read source metadata '{}' while preserving destination metadata: {}",
+                    source.display(),
+                    err
+                ),
+            )
+        })?;
+
+        if options.preserve_permissions {
+            fs::set_permissions(destination, source_metadata.permissions())
+                .await
+                .map_err(|err| {
+                    io_error(
+                        "DESTINATION_METADATA_ERROR",
+                        format!(
+                            "failed to set destination permissions '{}' from source '{}': {}",
+                            destination.display(),
+                            source.display(),
+                            err
+                        ),
+                    )
+                })?;
+        }
+
+        if options.preserve_timestamps {
+            let modified = source_metadata.modified().map_err(|err| {
+                io_error(
+                    "SOURCE_METADATA_ERROR",
+                    format!(
+                        "failed to read source modified time '{}' while preserving destination metadata: {}",
+                        source.display(),
+                        err
+                    ),
+                )
+            })?;
+            let accessed = source_metadata.accessed().unwrap_or(modified);
+            let atime = FileTime::from_system_time(accessed);
+            let mtime = FileTime::from_system_time(modified);
+            let destination_for_err = destination.to_path_buf();
+            let destination_for_set = destination_for_err.clone();
+
+            tokio::task::spawn_blocking(move || {
+                filetime::set_file_times(&destination_for_set, atime, mtime)
+            })
+                .await
+                .map_err(|err| CopyError {
+                    category: CopyErrorCategory::Interrupted,
+                    code: "DESTINATION_METADATA_JOIN_ERROR",
+                    message: format!(
+                        "failed to preserve destination timestamps because metadata worker was cancelled: {}",
+                        err
+                    ),
+                })?
+                .map_err(|err| {
+                    io_error(
+                        "DESTINATION_METADATA_ERROR",
+                        format!(
+                            "failed to set destination timestamps '{}': {}",
+                            destination_for_err.display(),
+                            err
+                        ),
+                    )
+                })?;
+        }
+
+        Ok(())
+    }
+
     async fn fan_out_copy_attempt(
         &self,
         task: &CopyTask,
         file_plan: &FilePlan,
         branches: &[DestinationBranchPlan],
         observer_pipeline: Option<&SourceObserverPipeline>,
+        total_bytes: u64,
+        base_complete_bytes: u64,
     ) -> Result<FanOutAttemptResult, CopyError> {
         let options = self.options()?;
         let mut reader = fs::File::open(&file_plan.source).await.map_err(|err| {
@@ -999,6 +1203,7 @@ impl PersistentTask {
         let mut observer_handles = Vec::new();
         if let Some(observer_pipeline) = observer_pipeline {
             for stage in &observer_pipeline.stages {
+                stage.reset_progress(file_plan.expected_size_bytes);
                 let (tx, rx) = mpsc::channel::<BranchMessage>(4);
                 observer_senders.push((stage.id().to_string(), tx));
                 let branch_name = format!(
@@ -1020,6 +1225,30 @@ impl PersistentTask {
         let mut buffer = vec![0_u8; options.buffer_size_bytes.max(1)];
         let mut offset = 0_u64;
         let mut stopped = None;
+        let mut transfer_progress = branches
+            .iter()
+            .map(|branch| ActiveTransferProgress {
+                source_path: file_plan.source.clone(),
+                destination_path: branch.requested_destination.clone(),
+                actual_destination_path: Some(branch.actual_destination.clone()),
+                bytes_copied: 0,
+                expected_bytes: branch.expected_bytes,
+                phase: TransferPhase::Copying,
+            })
+            .collect::<Vec<_>>();
+        let mut stage_progresses = self.collect_source_stage_progresses(
+            &file_plan.source,
+            observer_pipeline,
+            file_plan.expected_size_bytes,
+        );
+
+        self.publish_detailed_progress(
+            total_bytes,
+            base_complete_bytes,
+            transfer_progress.clone(),
+            stage_progresses.clone(),
+        )
+        .await?;
 
         loop {
             match self.current_run_outcome().await? {
@@ -1049,6 +1278,26 @@ impl PersistentTask {
                 bytes: Arc::<[u8]>::from(buffer[..read_len].to_vec()),
             };
             offset = offset.saturating_add(read_len as u64);
+
+            for transfer in &mut transfer_progress {
+                transfer.bytes_copied = transfer
+                    .bytes_copied
+                    .saturating_add(read_len as u64)
+                    .min(transfer.expected_bytes);
+            }
+            stage_progresses = self.collect_source_stage_progresses(
+                &file_plan.source,
+                observer_pipeline,
+                file_plan.expected_size_bytes,
+            );
+
+            self.publish_detailed_progress(
+                total_bytes,
+                base_complete_bytes,
+                transfer_progress.clone(),
+                stage_progresses.clone(),
+            )
+            .await?;
 
             let mut writer_index = 0;
             while writer_index < writers.len() {
@@ -1090,15 +1339,32 @@ impl PersistentTask {
                 ),
             })?;
             match result {
-                Ok(bytes_written) => branch_results.push(DestinationBranchResult {
-                    destination_path: requested,
-                    actual_destination_path: Some(actual),
-                    bytes_written,
-                    copy_status: DestinationCopyStatus::Succeeded,
-                    post_write_status: DestinationPostWriteStatus::Pending,
-                    error: None,
-                    retries: 0,
-                }),
+                Ok(bytes_written) => {
+                    if let Err(err) = self
+                        .preserve_destination_metadata(&file_plan.source, &actual, &options)
+                        .await
+                    {
+                        branch_results.push(DestinationBranchResult {
+                            destination_path: requested,
+                            actual_destination_path: Some(actual),
+                            bytes_written: 0,
+                            copy_status: DestinationCopyStatus::Failed,
+                            post_write_status: DestinationPostWriteStatus::NotRun,
+                            error: Some(err),
+                            retries: 0,
+                        });
+                    } else {
+                        branch_results.push(DestinationBranchResult {
+                            destination_path: requested,
+                            actual_destination_path: Some(actual),
+                            bytes_written,
+                            copy_status: DestinationCopyStatus::Succeeded,
+                            post_write_status: DestinationPostWriteStatus::Pending,
+                            error: None,
+                            retries: 0,
+                        });
+                    }
+                }
                 Err(err) => branch_results.push(DestinationBranchResult {
                     destination_path: requested,
                     actual_destination_path: Some(actual),
@@ -1126,8 +1392,45 @@ impl PersistentTask {
         }
 
         if let Some(outcome) = stopped {
+            for transfer in &mut transfer_progress {
+                transfer.phase = TransferPhase::Pending;
+            }
+            if let Some(observer_pipeline) = observer_pipeline {
+                for stage in &observer_pipeline.stages {
+                    stage.reset_progress(file_plan.expected_size_bytes);
+                }
+            }
+            stage_progresses = self.collect_source_stage_progresses(
+                &file_plan.source,
+                observer_pipeline,
+                file_plan.expected_size_bytes,
+            );
+            self.publish_detailed_progress(
+                total_bytes,
+                base_complete_bytes,
+                transfer_progress,
+                stage_progresses,
+            )
+            .await?;
             return Ok(FanOutAttemptResult::Stopped(outcome));
         }
+
+        for transfer in &mut transfer_progress {
+            transfer.phase = TransferPhase::Completed;
+            transfer.bytes_copied = transfer.expected_bytes;
+        }
+        stage_progresses = self.collect_source_stage_progresses(
+            &file_plan.source,
+            observer_pipeline,
+            file_plan.expected_size_bytes,
+        );
+        self.publish_detailed_progress(
+            total_bytes,
+            base_complete_bytes,
+            transfer_progress,
+            stage_progresses,
+        )
+        .await?;
 
         Ok(FanOutAttemptResult::Completed {
             observer_artifacts,
@@ -1143,6 +1446,7 @@ impl PersistentTask {
         pipeline: Option<&PostWritePipeline>,
     ) -> Result<Vec<DestinationBranchResult>, CopyError> {
         let snapshot = self.snapshot_task()?;
+        let (total_bytes, base_complete_bytes) = self.checkpoint_progress_totals().await?;
         match snapshot.flow.post_write_pipeline_mode() {
             PostWritePipelineMode::SerialAfterWrite => {}
         }
@@ -1173,8 +1477,56 @@ impl PersistentTask {
             return Ok(results);
         };
 
+        let transfer_progress = branches
+            .iter()
+            .map(|branch| {
+                let actual_destination = branch
+                    .actual_destination_path
+                    .clone()
+                    .unwrap_or_else(|| branch.destination_path.clone());
+                ActiveTransferProgress {
+                    source_path: source.to_path_buf(),
+                    destination_path: branch.destination_path.clone(),
+                    actual_destination_path: Some(actual_destination),
+                    bytes_copied: branch.bytes_written,
+                    expected_bytes: branch.bytes_written,
+                    phase: TransferPhase::PostWrite,
+                }
+            })
+            .collect::<Vec<_>>();
+        for stage in &pipeline.stages {
+            stage.reset_progress(Some(
+                branches
+                    .iter()
+                    .map(|branch| branch.bytes_written)
+                    .max()
+                    .unwrap_or(0),
+            ));
+        }
+        let mut stage_progresses = self.collect_post_write_stage_progresses(
+            source,
+            Some(pipeline),
+            Some(
+                branches
+                    .iter()
+                    .map(|branch| branch.bytes_written)
+                    .max()
+                    .unwrap_or(0),
+            ),
+        );
+        self.publish_detailed_progress(
+            total_bytes,
+            base_complete_bytes,
+            transfer_progress.clone(),
+            stage_progresses.clone(),
+        )
+        .await?;
+
         let mut join_set = JoinSet::new();
         for branch in branches {
+            for stage in &pipeline.stages {
+                stage.reset_progress(Some(branch.bytes_written));
+            }
             let requested = branch.destination_path.clone();
             let actual = branch
                 .actual_destination_path
@@ -1247,6 +1599,18 @@ impl PersistentTask {
                 ),
             })?;
 
+            let fallback_total = Some(ctx.expected_bytes.max(ctx.bytes_written));
+            stage_progresses =
+                self.collect_post_write_stage_progresses(source, Some(pipeline), fallback_total);
+
+            self.publish_detailed_progress(
+                total_bytes,
+                base_complete_bytes,
+                transfer_progress.clone(),
+                stage_progresses.clone(),
+            )
+            .await?;
+
             self.artifact_store
                 .save_destination_artifacts(
                     &self.id,
@@ -1306,6 +1670,9 @@ impl PersistentTask {
             }
         }
 
+        self.publish_detailed_progress(total_bytes, base_complete_bytes, Vec::new(), Vec::new())
+            .await?;
+
         Ok(results)
     }
 
@@ -1320,6 +1687,7 @@ impl PersistentTask {
         let expected_bytes = file_plan.expected_size_bytes.unwrap_or(0);
         let source_observer_pipeline = self.build_effective_source_observer_pipeline(&snapshot);
         let post_write_pipeline = self.build_effective_post_write_pipeline(&snapshot);
+        let (total_bytes, base_complete_bytes) = self.checkpoint_progress_totals().await?;
         let (mut copy_branches, mut results) = self
             .resolve_destination_branches(source, rows, options.overwrite_policy)
             .await?;
@@ -1415,6 +1783,8 @@ impl PersistentTask {
                     file_plan,
                     &copy_branches,
                     concurrent_source_observers,
+                    total_bytes,
+                    base_complete_bytes,
                 )
                 .await?
             {
@@ -1816,7 +2186,7 @@ impl Task for PersistentTask {
             .runtime
             .read()
             .map_err(|_| lock_poisoned_error("PersistentTask::progress"))?;
-        Ok(runtime.progress)
+        Ok(runtime.progress.clone())
     }
 
     fn subscribe(&self) -> Result<TaskStream, CopyError> {
@@ -1831,5 +2201,44 @@ impl Task for PersistentTask {
             .map_err(|_| lock_poisoned_error("PersistentTask::report"))?;
         runtime.report = Some(report.clone());
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::domain::{ActiveTransferProgress, TransferPhase};
+
+    use super::PersistentTask;
+
+    #[test]
+    fn compose_complete_bytes_clamps_to_total_bytes() {
+        let transfers = vec![ActiveTransferProgress {
+            source_path: PathBuf::from("/src/a.txt"),
+            destination_path: PathBuf::from("/dst/a.txt"),
+            actual_destination_path: None,
+            bytes_copied: 90,
+            expected_bytes: 90,
+            phase: TransferPhase::Copying,
+        }];
+
+        let complete = PersistentTask::compose_complete_bytes(100, 20, &transfers);
+        assert_eq!(complete, 100);
+    }
+
+    #[test]
+    fn compose_complete_bytes_uses_expected_bound_for_inflight() {
+        let transfers = vec![ActiveTransferProgress {
+            source_path: PathBuf::from("/src/b.txt"),
+            destination_path: PathBuf::from("/dst/b.txt"),
+            actual_destination_path: None,
+            bytes_copied: 80,
+            expected_bytes: 50,
+            phase: TransferPhase::Copying,
+        }];
+
+        let complete = PersistentTask::compose_complete_bytes(200, 40, &transfers);
+        assert_eq!(complete, 90);
     }
 }

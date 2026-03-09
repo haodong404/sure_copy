@@ -244,10 +244,61 @@ impl CopyTask {
 }
 
 /// Runtime progress in both bytes and file counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskProgress {
     pub total_bytes: u64,
     pub complete_bytes: u64,
+    pub active_transfers: Vec<ActiveTransferProgress>,
+    pub stage_progresses: Vec<StageProgress>,
+}
+
+impl Default for TaskProgress {
+    fn default() -> Self {
+        Self {
+            total_bytes: 0,
+            complete_bytes: 0,
+            active_transfers: Vec::new(),
+            stage_progresses: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransferPhase {
+    Pending,
+    Copying,
+    PostWrite,
+    Completed,
+    Skipped,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveTransferProgress {
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub actual_destination_path: Option<PathBuf>,
+    pub bytes_copied: u64,
+    pub expected_bytes: u64,
+    pub phase: TransferPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StageProgressStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageProgress {
+    pub stage_id: String,
+    pub source_path: PathBuf,
+    pub destination_path: Option<PathBuf>,
+    pub processed_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub status: StageProgressStatus,
 }
 
 /// Common error categories for reporting and filtering.

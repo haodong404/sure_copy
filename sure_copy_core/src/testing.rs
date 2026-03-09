@@ -16,7 +16,7 @@ use crate::orchestrator::sqlite_artifact_store::{
     SqliteArtifactStore, TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL, TASK_SOURCE_ARTIFACTS_SCHEMA_SQL,
 };
 use crate::pipeline::TaskFlowPlan;
-use crate::Task;
+use crate::{Task, TaskStream};
 
 pub struct PersistentTaskHarness {
     task: PersistentTask,
@@ -38,6 +38,10 @@ impl PersistentTaskHarness {
 
     pub fn snapshot(&self) -> CopyTask {
         self.task.snapshot()
+    }
+
+    pub fn subscribe(&self) -> Result<TaskStream, CopyError> {
+        self.task.subscribe()
     }
 
     pub fn pool(&self) -> &SqlitePool {

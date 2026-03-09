@@ -18,9 +18,10 @@ pub mod pipeline;
 pub mod testing;
 
 pub use domain::{
-    CopyError, CopyErrorCategory, CopyReport, CopyTask, CopyTaskId, DestinationCopyStatus,
-    DestinationPostWriteStatus, DestinationReport, FileFailure, FilePlan, OverwritePolicy,
-    RetryPolicy, TaskOptions, TaskProgress, TaskSpec, TaskState, TaskTemplate, VerificationPolicy,
+    ActiveTransferProgress, CopyError, CopyErrorCategory, CopyReport, CopyTask, CopyTaskId,
+    DestinationCopyStatus, DestinationPostWriteStatus, DestinationReport, FileFailure, FilePlan,
+    OverwritePolicy, RetryPolicy, StageProgress, StageProgressStatus, TaskOptions, TaskProgress,
+    TaskSpec, TaskState, TaskTemplate, TransferPhase, VerificationPolicy,
 };
 pub use interface::SureCopyCoreApi;
 pub use orchestrator::{
@@ -31,5 +32,5 @@ pub use pipeline::{
     ArtifactValue, NoopPostWriteStage, NoopSourceObserverStage, PipelineArtifacts,
     PostWriteContext, PostWritePipeline, PostWritePipelineMode, PostWriteStage, SourceChunk,
     SourceObserverPipeline, SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId,
-    TaskFlowPlan,
+    StageRuntimeProgress, TaskFlowPlan,
 };

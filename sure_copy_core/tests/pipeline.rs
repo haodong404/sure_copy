@@ -5,9 +5,10 @@ use async_trait::async_trait;
 use sure_copy_core::pipeline::{
     NoopPostWriteStage, NoopSourceObserverStage, PipelineArtifacts, PostWriteContext,
     PostWritePipeline, PostWritePipelineMode, PostWriteStage, SourceChunk, SourceObserverPipeline,
-    SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId, TaskFlowPlan,
+    SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId, StageRuntimeProgress,
+    TaskFlowPlan,
 };
-use sure_copy_core::{CopyError, CopyTask, FilePlan, TaskOptions};
+use sure_copy_core::{CopyError, CopyTask, FilePlan, StageProgressStatus, TaskOptions};
 
 #[derive(Default)]
 struct CountingObserverStage {
@@ -44,6 +45,44 @@ impl SourceObserverStage for CountingObserverStage {
 #[derive(Default)]
 struct RecordingPostWriteStage {
     invocations: Mutex<Vec<(PathBuf, u64)>>,
+}
+
+#[derive(Default)]
+struct ProgressAwareObserverStage {
+    seen_bytes: Mutex<u64>,
+}
+
+#[async_trait]
+impl SourceObserverStage for ProgressAwareObserverStage {
+    fn id(&self) -> StageId {
+        "progress-aware-observer"
+    }
+
+    fn reset_progress(&self, _total_bytes: Option<u64>) {
+        if let Ok(mut seen) = self.seen_bytes.lock() {
+            *seen = 0;
+        }
+    }
+
+    fn progress_state(&self) -> Option<StageRuntimeProgress> {
+        let seen = self.seen_bytes.lock().ok().map(|value| *value).unwrap_or(0);
+        Some(StageRuntimeProgress {
+            status: StageProgressStatus::Running,
+            processed_bytes: seen,
+            total_bytes: Some(16),
+        })
+    }
+
+    async fn observe_chunk(
+        &self,
+        _task: &CopyTask,
+        _plan: &FilePlan,
+        chunk: &SourceChunk,
+    ) -> Result<(), CopyError> {
+        let mut seen = self.seen_bytes.lock().expect("lock should not be poisoned");
+        *seen += chunk.len() as u64;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -228,4 +267,41 @@ async fn noop_stages_are_safe_defaults() {
             .is_empty(),
         true
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stage_progress_is_accessible_through_trait_api() {
+    let stage: Arc<dyn SourceObserverStage> = Arc::new(ProgressAwareObserverStage::default());
+    let task = CopyTask::new(
+        "task-stage-progress",
+        PathBuf::from("/src"),
+        vec![PathBuf::from("/dst")],
+        TaskOptions::default(),
+    );
+    let plan = FilePlan {
+        source: PathBuf::from("/src/file.txt"),
+        destinations: vec![PathBuf::from("/dst/file.txt")],
+        expected_size_bytes: Some(16),
+        expected_checksum: None,
+    };
+
+    stage.reset_progress(plan.expected_size_bytes);
+    stage
+        .observe_chunk(
+            &task,
+            &plan,
+            &SourceChunk {
+                offset: 0,
+                bytes: Arc::<[u8]>::from(&b"progress"[..]),
+            },
+        )
+        .await
+        .expect("progress-aware observer should accept chunk");
+
+    let progress = stage
+        .progress_state()
+        .expect("stage should expose progress state");
+    assert_eq!(progress.status, StageProgressStatus::Running);
+    assert_eq!(progress.processed_bytes, 8);
+    assert_eq!(progress.total_bytes, Some(16));
 }

@@ -76,6 +76,7 @@ async fn managed_task_emits_state_and_progress_updates() {
         .set_progress(TaskProgress {
             total_bytes: 100,
             complete_bytes: 30,
+            ..TaskProgress::default()
         })
         .expect("set_progress should work");
 
@@ -90,6 +91,7 @@ async fn managed_task_emits_state_and_progress_updates() {
         TaskUpdate::Progress(TaskProgress {
             total_bytes: 100,
             complete_bytes: 30,
+            ..TaskProgress::default()
         })
     );
 }
@@ -168,6 +170,7 @@ async fn managed_task_report_uses_latest_progress_values() {
         .set_progress(TaskProgress {
             total_bytes: 200,
             complete_bytes: 123,
+            ..TaskProgress::default()
         })
         .expect("set_progress should work");
 
@@ -184,6 +187,7 @@ async fn report_is_recomputed_after_progress_changes() {
         .set_progress(TaskProgress {
             total_bytes: 100,
             complete_bytes: 10,
+            ..TaskProgress::default()
         })
         .expect("set progress should work");
     let report1 = handle.report().await.expect("report should work");
@@ -194,6 +198,7 @@ async fn report_is_recomputed_after_progress_changes() {
         .set_progress(TaskProgress {
             total_bytes: 200,
             complete_bytes: 80,
+            ..TaskProgress::default()
         })
         .expect("set progress should work");
     let report2 = handle.report().await.expect("report should work");

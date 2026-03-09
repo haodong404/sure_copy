@@ -242,6 +242,7 @@ fn task_from_row(row: DbTaskRow) -> Result<(CopyTask, TaskProgress), CopyError> 
     let progress = TaskProgress {
         total_bytes: row.total_bytes.max(0) as u64,
         complete_bytes: row.complete_bytes.max(0) as u64,
+        ..TaskProgress::default()
     };
 
     Ok((task, progress))
