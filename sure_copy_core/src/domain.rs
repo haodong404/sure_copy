@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline::TaskPipelinePlan;
+use crate::pipeline::{PostWritePipelineMode, SourcePipelineMode, TaskFlowPlan};
 
 fn available_cpu_parallelism() -> usize {
     std::thread::available_parallelism()
@@ -20,6 +20,7 @@ pub enum TaskState {
     Planned,
     Running,
     Completed,
+    PartialFailed,
     Failed,
     Cancelled,
     Paused,
@@ -28,19 +29,31 @@ pub enum TaskState {
 impl TaskState {
     /// Checks whether a transition to `next` is allowed by the recommended state machine.
     pub fn can_transition_to(self, next: TaskState) -> bool {
-        use TaskState::{Cancelled, Completed, Created, Failed, Paused, Planned, Running};
+        use TaskState::{
+            Cancelled, Completed, Created, Failed, PartialFailed, Paused, Planned, Running,
+        };
 
         match (self, next) {
             (Created, Planned) => true,
             (Created, Cancelled) => true,
             (Planned, Running) => true,
             (Planned, Cancelled) => true,
-            (Running, Completed | Failed | Cancelled | Paused) => true,
+            (Running, Completed | PartialFailed | Failed | Cancelled | Paused) => true,
             (Paused, Running | Cancelled) => true,
             // Self-transition can simplify idempotent orchestration calls.
             (a, b) if a == b => true,
             _ => false,
         }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TaskState::Completed
+                | TaskState::PartialFailed
+                | TaskState::Failed
+                | TaskState::Cancelled
+        )
     }
 }
 
@@ -57,8 +70,21 @@ pub enum OverwritePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerificationPolicy {
     None,
-    PostCopy,
-    PreAndPostCopy,
+    PostWrite,
+    SourceHashAndPostWrite,
+}
+
+impl VerificationPolicy {
+    pub fn requires_source_hash_observer(self) -> bool {
+        matches!(self, VerificationPolicy::SourceHashAndPostWrite)
+    }
+
+    pub fn requires_post_write_verification(self) -> bool {
+        matches!(
+            self,
+            VerificationPolicy::PostWrite | VerificationPolicy::SourceHashAndPostWrite
+        )
+    }
 }
 
 /// Retry behavior for retryable failures.
@@ -101,7 +127,7 @@ impl Default for TaskOptions {
 
         Self {
             overwrite_policy: OverwritePolicy::Skip,
-            verification_policy: VerificationPolicy::PostCopy,
+            verification_policy: VerificationPolicy::PostWrite,
             retry_policy: RetryPolicy::default(),
             max_concurrency: cpu * 2,
             per_file_pipeline_parallelism: cpu,
@@ -121,6 +147,10 @@ pub struct TaskSpec {
     pub source_root: PathBuf,
     pub destinations: Vec<PathBuf>,
     pub options: TaskOptions,
+    #[serde(default)]
+    pub source_pipeline_mode: SourcePipelineMode,
+    #[serde(default)]
+    pub post_write_pipeline_mode: PostWritePipelineMode,
 }
 
 impl TaskSpec {
@@ -129,6 +159,8 @@ impl TaskSpec {
             source_root,
             destinations,
             options,
+            source_pipeline_mode: SourcePipelineMode::default(),
+            post_write_pipeline_mode: PostWritePipelineMode::default(),
         }
     }
 }
@@ -150,7 +182,7 @@ pub struct CopyTask {
     pub destinations: Vec<PathBuf>,
     pub options: TaskOptions,
     #[serde(skip_serializing)]
-    pub pipelines: TaskPipelinePlan,
+    pub flow: TaskFlowPlan,
     pub state: TaskState,
     pub file_plans: Vec<FilePlan>,
 }
@@ -173,7 +205,9 @@ impl CopyTask {
             source_root: spec.source_root,
             destinations: spec.destinations,
             options: spec.options,
-            pipelines: TaskPipelinePlan::default(),
+            flow: TaskFlowPlan::default()
+                .with_source_pipeline_mode(spec.source_pipeline_mode)
+                .with_post_write_pipeline_mode(spec.post_write_pipeline_mode),
             state: TaskState::Created,
             file_plans: Vec::new(),
         }
@@ -185,12 +219,14 @@ impl CopyTask {
             source_root: self.source_root.clone(),
             destinations: self.destinations.clone(),
             options: self.options.clone(),
+            source_pipeline_mode: self.flow.source_pipeline_mode(),
+            post_write_pipeline_mode: self.flow.post_write_pipeline_mode(),
         }
     }
 
-    /// Overrides task pipeline plan.
-    pub fn with_pipelines(mut self, pipelines: TaskPipelinePlan) -> Self {
-        self.pipelines = pipelines;
+    /// Overrides task flow plan.
+    pub fn with_flow(mut self, flow: TaskFlowPlan) -> Self {
+        self.flow = flow;
         self
     }
 
@@ -254,6 +290,33 @@ pub struct FileFailure {
     pub retries: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DestinationCopyStatus {
+    Pending,
+    Skipped,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum DestinationPostWriteStatus {
+    Pending,
+    NotRun,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DestinationReport {
+    pub source_path: PathBuf,
+    pub destination_path: PathBuf,
+    pub actual_destination_path: Option<PathBuf>,
+    pub bytes_written: u64,
+    pub copy_status: DestinationCopyStatus,
+    pub post_write_status: DestinationPostWriteStatus,
+    pub error: Option<CopyError>,
+}
+
 /// Task-level report output.
 #[derive(Clone, Serialize)]
 pub struct CopyReport {
@@ -267,6 +330,7 @@ pub struct CopyReport {
     pub duration_ms: u128,
     pub retry_count: u64,
     pub failures: Vec<FileFailure>,
+    pub destinations: Vec<DestinationReport>,
 }
 
 /// Template that can be reused and versioned.
@@ -293,6 +357,7 @@ mod tests {
         assert!(TaskState::Running.can_transition_to(TaskState::Paused));
         assert!(TaskState::Paused.can_transition_to(TaskState::Running));
         assert!(TaskState::Running.can_transition_to(TaskState::Completed));
+        assert!(TaskState::Running.can_transition_to(TaskState::PartialFailed));
     }
 
     #[test]
@@ -305,7 +370,7 @@ mod tests {
     fn task_options_default_is_safe() {
         let opts = TaskOptions::default();
         assert_eq!(opts.overwrite_policy, OverwritePolicy::Skip);
-        assert_eq!(opts.verification_policy, VerificationPolicy::PostCopy);
+        assert_eq!(opts.verification_policy, VerificationPolicy::PostWrite);
         assert!(opts.max_concurrency >= 1);
         assert!(opts.per_file_pipeline_parallelism >= 1);
         assert!(opts.checksum_parallelism >= 1);
@@ -327,6 +392,7 @@ mod tests {
             TaskState::Planned,
             TaskState::Running,
             TaskState::Completed,
+            TaskState::PartialFailed,
             TaskState::Failed,
             TaskState::Cancelled,
             TaskState::Paused,
@@ -357,8 +423,16 @@ mod tests {
         assert_eq!(task.id, "task-123");
         assert_eq!(task.state, TaskState::Created);
         assert!(task.file_plans.is_empty());
-        assert!(task.pipelines.pre_copy_pipeline.is_none());
-        assert!(task.pipelines.post_copy_pipeline.is_none());
+        assert!(task.flow.source_observer.is_none());
+        assert!(task.flow.post_write.is_none());
+        assert_eq!(
+            task.flow.source_pipeline_mode(),
+            SourcePipelineMode::ConcurrentWithFanOut
+        );
+        assert_eq!(
+            task.flow.post_write_pipeline_mode(),
+            PostWritePipelineMode::SerialAfterWrite
+        );
     }
 
     #[test]
@@ -381,5 +455,50 @@ mod tests {
 
         assert_eq!(task.state, TaskState::Planned);
         assert_eq!(task.file_plans, file_plans);
+    }
+
+    #[test]
+    fn task_spec_roundtrip_preserves_flow_modes() {
+        let task = CopyTask::new(
+            "task-pipeline-spec",
+            PathBuf::from("/source"),
+            vec![PathBuf::from("/dest")],
+            TaskOptions::default(),
+        )
+        .with_flow(
+            TaskFlowPlan::new()
+                .with_source_pipeline_mode(SourcePipelineMode::SerialBeforeFanOut)
+                .with_post_write_pipeline_mode(PostWritePipelineMode::SerialAfterWrite),
+        );
+
+        let spec = task.spec();
+        assert_eq!(
+            spec.source_pipeline_mode,
+            SourcePipelineMode::SerialBeforeFanOut
+        );
+        assert_eq!(
+            spec.post_write_pipeline_mode,
+            PostWritePipelineMode::SerialAfterWrite
+        );
+
+        let restored = CopyTask::from_spec("task-restored", spec);
+        assert_eq!(
+            restored.flow.source_pipeline_mode(),
+            SourcePipelineMode::SerialBeforeFanOut
+        );
+        assert_eq!(
+            restored.flow.post_write_pipeline_mode(),
+            PostWritePipelineMode::SerialAfterWrite
+        );
+    }
+
+    #[test]
+    fn verification_policy_maps_to_builtin_flow_requirements() {
+        assert!(!VerificationPolicy::None.requires_source_hash_observer());
+        assert!(!VerificationPolicy::None.requires_post_write_verification());
+        assert!(!VerificationPolicy::PostWrite.requires_source_hash_observer());
+        assert!(VerificationPolicy::PostWrite.requires_post_write_verification());
+        assert!(VerificationPolicy::SourceHashAndPostWrite.requires_source_hash_observer());
+        assert!(VerificationPolicy::SourceHashAndPostWrite.requires_post_write_verification());
     }
 }

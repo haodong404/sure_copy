@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sure_copy_core::{CopyError, CopyTask, OrchestratorConfig, Task, TaskOrchestrator, TaskState};
+use sure_copy_core::{
+    CopyError, CopyTask, OrchestratorConfig, SourcePipelineMode, Task, TaskOrchestrator, TaskState,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_orchestrator_default_methods_return_not_implemented() {
@@ -72,7 +74,7 @@ fn default_config_is_conservative() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn task_creation_has_default_serial_pre_copy_mode() {
+async fn task_creation_has_default_streaming_source_mode() {
     struct StubTask {
         task: CopyTask,
     }
@@ -115,7 +117,11 @@ async fn task_creation_has_default_serial_pre_copy_mode() {
         .expect("get_task should work");
 
     assert_eq!(
-        handle.snapshot().pipelines.pre_copy_mode,
-        sure_copy_core::pipeline::PreCopyPipelineMode::SerialBeforeCopy
+        handle.snapshot().flow.source_pipeline_mode(),
+        SourcePipelineMode::ConcurrentWithFanOut
+    );
+    assert_eq!(
+        handle.snapshot().flow.post_write_pipeline_mode(),
+        sure_copy_core::pipeline::PostWritePipelineMode::SerialAfterWrite
     );
 }

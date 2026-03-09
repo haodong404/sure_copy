@@ -47,8 +47,8 @@ The core module is responsible for **reliable copying** itself: task orchestrati
    - Supports overwrite policies (skip, overwrite, rename, timestamp-based decision).
    - Supports file metadata preservation (timestamps, permissions, extended attributes) with platform-aware handling.
 
-2. **Data Checksum** (implemented by 2 ProcessingStages: HashingStage and VerificationStage)
-   - Supports optional pre-check and recommended post-check.
+2. **Data Checksum** (implemented by source observers and post-write verification)
+   - Supports optional source-hash generation during fan-out and recommended post-write verification.
    - Supports multiple algorithms (e.g., `SHA-256`, `BLAKE3`) selected by policy.
    - Routes verification failures into retry/quarantine workflows with detailed diagnostics.
 
@@ -79,8 +79,8 @@ Exception branches: `Failed`, `Cancelled`, `Paused`
 
 - `Created`: Task parameters are validated.
 - `Planned`: Directory scan is complete and execution plan is generated.
-- `Running`: Copy and processing pipeline execution is in progress.
-- `Completed`: Report is finalized and queryable.
+- `Running`: Source fan-out, destination writes, and post-write verification are in progress.
+- `Completed/PartialFailed`: Report is finalized and queryable.
 - `Failed/Cancelled/Paused`: Recoverable context is preserved.
 
 ### Error Handling and Recovery Strategy
@@ -111,18 +111,18 @@ Exception branches: `Failed`, `Cancelled`, `Paused`
 
 This section documents the current `sure_copy_core` API shape to keep code and docs aligned.
 
-### 1) Create a task with custom pipelines
+### 1) Create a task with custom flow modes
 
-`CopyTask` now includes pipeline customization directly via `pipelines: TaskPipelinePlan`.
+`CopyTask` now includes flow customization directly via `flow: TaskFlowPlan`.
 
 - Use `CopyTask::new(...)` for safe defaults.
-- Override pipelines with `.with_pipelines(...)`.
-- Default pre-copy mode is `PreCopyPipelineMode::SerialBeforeCopy`.
+- Override flow modes with `.with_flow(...)`.
+- Default source mode is `SourcePipelineMode::ConcurrentWithFanOut`.
 
 Conceptual example:
 
 - Build task: id + source + destinations + options
-- Attach pre/post pipelines in `TaskPipelinePlan`
+- Attach source/post-write flow preferences in `TaskFlowPlan`
 - Submit task through `SureCopyCoreApi::submit(...)`
 
 ### 2) Runtime task access model
@@ -130,7 +130,7 @@ Conceptual example:
 `TaskOrchestrator` returns a `Task` handle.
 
 - `Task::id()` returns the stable task id.
-- `Task::snapshot()` returns a runtime snapshot (`CopyTask`) including current pipeline plan.
+- `Task::snapshot()` returns a runtime snapshot (`CopyTask`) including current flow plan.
 - Lifecycle methods: `run`, `pause`, `resume`, `cancel`.
 
 ### 3) Realtime updates
@@ -142,22 +142,23 @@ Subscribe with `Task::subscribe()` (or `SureCopyCoreApi::subscribe(task_id)`) to
 - `TaskUpdate::State(TaskState)`
 - `TaskUpdate::Progress(TaskProgress)`
 
-### 4) Streaming stage contract (serial chain)
+### 4) Streaming fan-out contract
 
-In serial stage execution, each stage can stream-consume output from the previous stage.
+The durable runtime treats each source file as one flow session.
 
-- `ProcessingStage::execute_stream(..., input: Option<BoxStageStream>)`
-- For non-source stages in serial mode, `input` is the previous stage output stream.
-- `StageStream::next()` yields `StageItem` (`Result<StageChunk, CopyError>`) incrementally.
+- One source reader fans chunks out to multiple destination writers.
+- `SourceObserverStage` can inspect source chunks without mutating payload.
+- `PostWriteStage` runs against a single destination after that destination finishes writing.
+- `TaskFlowPlan` selects `SourcePipelineMode` and `PostWritePipelineMode`.
 
-This enables large-file friendly stage processing without loading full file content into memory.
+This keeps the copy path streaming-friendly without loading whole file content into memory.
 
 ### 5) Minimal async flow
 
 Typical integration flow:
 
 1. Build a `CopyTask` using `CopyTask::new(...)`.
-2. Attach custom `TaskPipelinePlan` if needed.
+2. Attach custom `TaskFlowPlan` if needed.
 3. Call `SureCopyCoreApi::submit(task).await`.
 4. Read identity via `task_handle.id()`.
 5. Read runtime snapshot via `task_handle.snapshot()`.
@@ -168,7 +169,7 @@ Skeleton snippet:
 
 ```rust
 let task = CopyTask::new("task-001", src, vec![dst], TaskOptions::default())
-   .with_pipelines(TaskPipelinePlan::new());
+   .with_flow(TaskFlowPlan::new());
 
 let handle = api.submit(task).await?;
 let task_id = handle.id().to_string();
@@ -187,11 +188,11 @@ while let Ok(update) = updates.recv().await {
 }
 ```
 
-### 6) Naming migration note
+### 6) Flow naming note
 
-The task runtime getter has been renamed:
+The older `PreCopy/PostCopy` pipeline naming has been replaced by the more accurate flow model:
 
-- Old: `Task::config()`
-- New: `Task::snapshot()`
+- `SourceObserverStage` / `SourcePipelineMode`
+- `PostWriteStage` / `PostWritePipelineMode`
 
-This better reflects that callers read the current runtime view of task data.
+This better matches the actual runtime topology: one source reader, fan-out writes, and per-destination post-write hooks.

@@ -14,12 +14,16 @@ use crate::infrastructure::{
     ChecksumProvider, FileSystem, LocalFileSystem, Sha256ChecksumProvider,
 };
 
+use super::artifact_store::ArtifactStore;
 use super::config::OrchestratorConfig;
 use super::errors::{duplicate_task_error, task_not_found_error, unsupported_feature_error};
 use super::persistent_task::PersistentTask;
+use super::sqlite_artifact_store::{
+    SqliteArtifactStore, TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL, TASK_SOURCE_ARTIFACTS_SCHEMA_SQL,
+};
 use super::task::{Task, TaskOrchestrator};
 
-const TASKS_SCHEMA_SQL: &str = r#"
+pub(crate) const TASKS_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     source_root TEXT NOT NULL,
@@ -31,12 +35,14 @@ CREATE TABLE IF NOT EXISTS tasks (
 );
 "#;
 
-const TASK_FILE_CHECKPOINTS_SCHEMA_SQL: &str = r#"
+pub(crate) const TASK_FILE_CHECKPOINTS_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS task_file_checkpoints (
     task_id TEXT NOT NULL,
     source_path TEXT NOT NULL,
     destination_path TEXT NOT NULL,
     status TEXT NOT NULL,
+    copy_status TEXT NOT NULL DEFAULT 'pending',
+    post_write_status TEXT NOT NULL DEFAULT 'pending',
     bytes_copied INTEGER NOT NULL DEFAULT 0,
     expected_bytes INTEGER NOT NULL DEFAULT 0,
     actual_destination_path TEXT,
@@ -52,6 +58,10 @@ const TASK_FILE_CHECKPOINTS_EXPECTED_BYTES_MIGRATION_SQL: &str =
     "ALTER TABLE task_file_checkpoints ADD COLUMN expected_bytes INTEGER NOT NULL DEFAULT 0";
 const TASK_FILE_CHECKPOINTS_ACTUAL_DESTINATION_MIGRATION_SQL: &str =
     "ALTER TABLE task_file_checkpoints ADD COLUMN actual_destination_path TEXT";
+const TASK_FILE_CHECKPOINTS_COPY_STATUS_MIGRATION_SQL: &str =
+    "ALTER TABLE task_file_checkpoints ADD COLUMN copy_status TEXT NOT NULL DEFAULT 'pending'";
+const TASK_FILE_CHECKPOINTS_POST_WRITE_STATUS_MIGRATION_SQL: &str =
+    "ALTER TABLE task_file_checkpoints ADD COLUMN post_write_status TEXT NOT NULL DEFAULT 'pending'";
 
 fn db_error(context: &'static str, err: sqlx::Error) -> CopyError {
     CopyError {
@@ -107,9 +117,9 @@ fn map_submit_error(task_id: &str, err: sqlx::Error) -> CopyError {
 }
 
 fn validate_submitted_task(task: &CopyTask) -> Result<(), CopyError> {
-    if task.pipelines.pre_copy_pipeline.is_some() || task.pipelines.post_copy_pipeline.is_some() {
+    if task.flow.has_runtime_stages() {
         return Err(unsupported_feature_error(
-            "durable custom pipelines for SQLite-backed tasks",
+            "durable custom runtime stages for SQLite-backed tasks",
         ));
     }
 
@@ -148,6 +158,7 @@ fn state_to_db_value(state: TaskState) -> &'static str {
         TaskState::Planned => "planned",
         TaskState::Running => "running",
         TaskState::Completed => "completed",
+        TaskState::PartialFailed => "partial_failed",
         TaskState::Failed => "failed",
         TaskState::Cancelled => "cancelled",
         TaskState::Paused => "paused",
@@ -160,6 +171,7 @@ fn state_from_db_value(value: &str) -> Option<TaskState> {
         "planned" => Some(TaskState::Planned),
         "running" => Some(TaskState::Running),
         "completed" => Some(TaskState::Completed),
+        "partial_failed" => Some(TaskState::PartialFailed),
         "failed" => Some(TaskState::Failed),
         "cancelled" => Some(TaskState::Cancelled),
         "paused" => Some(TaskState::Paused),
@@ -242,6 +254,7 @@ pub struct SqliteTaskOrchestrator {
     tasks: AsyncRwLock<HashMap<String, Arc<PersistentTask>>>,
     file_system: Arc<dyn FileSystem>,
     checksum_provider: Arc<dyn ChecksumProvider>,
+    artifact_store: Arc<dyn ArtifactStore>,
 }
 
 impl SqliteTaskOrchestrator {
@@ -294,6 +307,34 @@ impl SqliteTaskOrchestrator {
             "SqliteTaskOrchestrator::migrate_checkpoint_actual_destination",
         )
         .await?;
+        apply_best_effort_migration(
+            &pool,
+            TASK_FILE_CHECKPOINTS_COPY_STATUS_MIGRATION_SQL,
+            "SqliteTaskOrchestrator::migrate_checkpoint_copy_status",
+        )
+        .await?;
+        apply_best_effort_migration(
+            &pool,
+            TASK_FILE_CHECKPOINTS_POST_WRITE_STATUS_MIGRATION_SQL,
+            "SqliteTaskOrchestrator::migrate_checkpoint_post_write_status",
+        )
+        .await?;
+        sqlx::query(TASK_SOURCE_ARTIFACTS_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .map_err(|err| db_error("SqliteTaskOrchestrator::new_source_artifact_schema", err))?;
+        sqlx::query(TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .map_err(|err| {
+                db_error(
+                    "SqliteTaskOrchestrator::new_destination_artifact_schema",
+                    err,
+                )
+            })?;
+
+        let artifact_store: Arc<dyn ArtifactStore> =
+            Arc::new(SqliteArtifactStore::new(pool.clone()));
 
         let orchestrator = Self {
             config,
@@ -301,6 +342,7 @@ impl SqliteTaskOrchestrator {
             tasks: AsyncRwLock::new(HashMap::new()),
             file_system: Arc::new(LocalFileSystem::new()),
             checksum_provider: Arc::new(Sha256ChecksumProvider::new()),
+            artifact_store,
         };
 
         let recovered = orchestrator.recover_unfinished_tasks().await?;
@@ -326,11 +368,14 @@ impl SqliteTaskOrchestrator {
             .map_err(|err| db_error("SqliteTaskOrchestrator::recover_unfinished_tasks", err))?;
 
         let checkpoint_result = sqlx::query(
-            "UPDATE task_file_checkpoints SET status = ?, updated_at_ms = ? WHERE status = ?",
+            "UPDATE task_file_checkpoints SET status = ?, copy_status = ?, post_write_status = ?, updated_at_ms = ? WHERE status IN (?, ?)",
         )
         .bind("pending")
+        .bind("pending")
+        .bind("pending")
         .bind(now_unix_ms())
-        .bind("running")
+        .bind("writing")
+        .bind("post_write_running")
         .execute(&self.pool)
         .await
         .map_err(|err| {
@@ -411,6 +456,7 @@ impl SqliteTaskOrchestrator {
             self.pool.clone(),
             Arc::clone(&self.file_system),
             Arc::clone(&self.checksum_provider),
+            Arc::clone(&self.artifact_store),
         ));
 
         Ok(handle)
@@ -445,6 +491,7 @@ impl TaskOrchestrator for SqliteTaskOrchestrator {
             self.pool.clone(),
             Arc::clone(&self.file_system),
             Arc::clone(&self.checksum_provider),
+            Arc::clone(&self.artifact_store),
         ));
 
         let mut tasks = self.tasks.write().await;
@@ -535,10 +582,7 @@ impl TaskOrchestrator for SqliteTaskOrchestrator {
 
         for handle in handles {
             let state = handle.state().await?;
-            if state != TaskState::Cancelled
-                && state != TaskState::Completed
-                && state != TaskState::Failed
-            {
+            if !state.is_terminal() {
                 handle.cancel().await?;
             }
         }
@@ -558,6 +602,7 @@ mod tests {
             TaskState::Planned,
             TaskState::Running,
             TaskState::Completed,
+            TaskState::PartialFailed,
             TaskState::Failed,
             TaskState::Cancelled,
             TaskState::Paused,

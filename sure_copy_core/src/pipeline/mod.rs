@@ -1,12 +1,12 @@
 mod plan;
 mod stage;
-mod stream;
+mod stages;
 mod types;
 
-pub use plan::TaskPipelinePlan;
-pub use stage::{NoopStage, ProcessingStage};
-pub use stream::{BoxStageStream, InMemoryStageStream, StageStream};
+pub use plan::{PostWritePipeline, SourceObserverPipeline, TaskFlowPlan};
+pub use stage::{NoopPostWriteStage, NoopSourceObserverStage, PostWriteStage, SourceObserverStage};
+pub(crate) use stages::{DestinationChecksumVerifyStage, SourceHashStage};
 pub use types::{
-    Pipeline, PipelineKind, PreCopyPipelineMode, StageCapability, StageChunk, StageExecution,
-    StageExecutionHint, StageId, StageItem, StageNode, StageOutput,
+    ArtifactValue, PipelineArtifacts, PostWriteContext, PostWritePipelineMode, SourceChunk,
+    SourcePipelineMode, StageArtifacts, StageId,
 };

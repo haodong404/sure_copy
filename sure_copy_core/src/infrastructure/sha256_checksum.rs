@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 use crate::domain::{CopyError, CopyErrorCategory};
-use crate::infrastructure::ChecksumProvider;
+use crate::infrastructure::{ChecksumProvider, StreamingChecksum};
 
 /// SHA-256 checksum provider backed by streaming Tokio file reads.
 #[derive(Debug, Default, Clone, Copy)]
@@ -51,6 +51,12 @@ impl ChecksumProvider for Sha256ChecksumProvider {
         "SHA-256"
     }
 
+    fn begin_stream(&self) -> Result<Box<dyn StreamingChecksum>, CopyError> {
+        Ok(Box::new(Sha256StreamingChecksum {
+            hasher: Sha256::new(),
+        }))
+    }
+
     async fn checksum_file(&self, path: &Path) -> Result<String, CopyError> {
         debug!("calculating SHA-256 for '{}'", path.display());
         let mut file = tokio::fs::File::open(path)
@@ -74,5 +80,19 @@ impl ChecksumProvider for Sha256ChecksumProvider {
         let digest = format!("{:x}", hasher.finalize());
         debug!("calculated SHA-256 for '{}'", path.display());
         Ok(digest)
+    }
+}
+
+struct Sha256StreamingChecksum {
+    hasher: Sha256,
+}
+
+impl StreamingChecksum for Sha256StreamingChecksum {
+    fn update(&mut self, chunk: &[u8]) {
+        self.hasher.update(chunk);
+    }
+
+    fn finalize(self: Box<Self>) -> String {
+        format!("{:x}", self.hasher.finalize())
     }
 }

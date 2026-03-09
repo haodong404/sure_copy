@@ -1,100 +1,211 @@
-use super::stage::ProcessingStage;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
-/// Stable identifier for a processing stage.
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
+
+/// Stable identifier for a runtime stage.
 pub type StageId = &'static str;
 
-/// Describes whether this is a pre-copy or post-copy pipeline.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineKind {
-    PreCopy,
-    PostCopy,
+/// Defines how source-side observer stages run relative to destination writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourcePipelineMode {
+    /// Run the source observer pipeline before starting destination writes.
+    SerialBeforeFanOut,
+    /// Fan out each source chunk to destination writers and source observers together.
+    ConcurrentWithFanOut,
 }
 
-/// Defines how the pre-copy pipeline runs relative to copy execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PreCopyPipelineMode {
-    /// Reserved for a future runtime that can execute the pre-copy pipeline concurrently.
-    ConcurrentWithCopy,
-    /// Pre-copy stages complete before copy starts.
-    SerialBeforeCopy,
-}
-
-/// Stage capabilities used for scheduling and topology validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StageCapability {
-    pub parallelizable: bool,
-    pub output_size_changing: bool,
-    pub reversible: bool,
-    pub cpu_intensive: bool,
-}
-
-impl Default for StageCapability {
+impl Default for SourcePipelineMode {
     fn default() -> Self {
-        Self {
-            parallelizable: true,
-            output_size_changing: false,
-            reversible: false,
-            cpu_intensive: false,
+        Self::ConcurrentWithFanOut
+    }
+}
+
+/// Defines how per-destination post-write stages run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PostWritePipelineMode {
+    /// Run all post-write stages serially after a destination write completes.
+    SerialAfterWrite,
+}
+
+impl Default for PostWritePipelineMode {
+    fn default() -> Self {
+        Self::SerialAfterWrite
+    }
+}
+
+/// One immutable source chunk distributed to pipeline branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceChunk {
+    pub offset: u64,
+    pub bytes: Arc<[u8]>,
+}
+
+impl SourceChunk {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// Small structured outputs emitted by observer or post-write stages.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value")]
+pub enum ArtifactValue {
+    String(String),
+    Integer(i64),
+    Boolean(bool),
+    Json(JsonValue),
+}
+
+impl ArtifactValue {
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Boolean(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    pub fn as_json(&self) -> Option<&JsonValue> {
+        match self {
+            Self::Json(value) => Some(value),
+            _ => None,
         }
     }
 }
 
-/// Scheduling hint for runtime execution strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageExecutionHint {
-    IoBound,
-    CpuBound,
+impl From<String> for ArtifactValue {
+    fn from(value: String) -> Self {
+        Self::String(value)
+    }
 }
 
-/// Input execution mode for stage groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageExecution {
-    Serial,
-    Parallel,
+impl From<&str> for ArtifactValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
+    }
 }
 
-/// Unified stage output placeholder.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageOutput {
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub metadata: Vec<(String, String)>,
+impl From<i64> for ArtifactValue {
+    fn from(value: i64) -> Self {
+        Self::Integer(value)
+    }
 }
 
-/// One streaming chunk produced by a stage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageChunk {
-    pub bytes: Vec<u8>,
-    pub metadata: Vec<(String, String)>,
+impl From<bool> for ArtifactValue {
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
 }
 
-/// Stream item type between stages.
-pub type StageItem = Result<StageChunk, crate::domain::CopyError>;
-
-/// Stage topology node supporting mixed serial/parallel composition.
-pub enum StageNode {
-    Stage(Box<dyn ProcessingStage>),
-    Group {
-        execution: StageExecution,
-        children: Vec<StageNode>,
-    },
+impl From<JsonValue> for ArtifactValue {
+    fn from(value: JsonValue) -> Self {
+        Self::Json(value)
+    }
 }
 
-/// Pipeline definition independent from concrete execution engine.
-pub struct Pipeline {
-    pub kind: PipelineKind,
-    pub root: StageNode,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StageArtifacts {
+    pub values: BTreeMap<String, ArtifactValue>,
 }
 
-impl Pipeline {
-    /// Creates a pipeline with a root stage group.
-    pub fn new(kind: PipelineKind, execution: StageExecution, children: Vec<StageNode>) -> Self {
-        Self {
-            kind,
-            root: StageNode::Group {
-                execution,
-                children,
-            },
+impl StageArtifacts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_value(mut self, key: impl Into<String>, value: impl Into<ArtifactValue>) -> Self {
+        self.values.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn get(&self, key: &str) -> Option<&ArtifactValue> {
+        self.values.get(key)
+    }
+
+    pub fn get_string(&self, key: &str) -> Option<&str> {
+        self.get(key)?.as_str()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+}
+
+/// Aggregated stage outputs, namespaced by stage id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PipelineArtifacts {
+    stage_outputs: BTreeMap<String, StageArtifacts>,
+}
+
+impl PipelineArtifacts {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert_stage_output(&mut self, stage_key: impl Into<String>, artifacts: StageArtifacts) {
+        if artifacts.is_empty() {
+            return;
         }
+        self.stage_outputs.insert(stage_key.into(), artifacts);
+    }
+
+    pub fn get(&self, stage_id: &str, key: &str) -> Option<&ArtifactValue> {
+        self.stage_outputs.get(stage_id)?.get(key)
+    }
+
+    pub fn get_string(&self, stage_id: &str, key: &str) -> Option<&str> {
+        self.get(stage_id, key)?.as_str()
+    }
+
+    pub fn stage(&self, stage_id: &str) -> Option<&StageArtifacts> {
+        self.stage_outputs.get(stage_id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &StageArtifacts)> {
+        self.stage_outputs
+            .iter()
+            .map(|(stage_id, artifacts)| (stage_id.as_str(), artifacts))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stage_outputs.is_empty()
+    }
+}
+
+/// Input for a single post-write stage execution.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PostWriteContext {
+    pub task_id: String,
+    pub source_path: PathBuf,
+    pub requested_destination_path: PathBuf,
+    pub actual_destination_path: PathBuf,
+    pub bytes_written: u64,
+    pub expected_bytes: u64,
+    pub pipeline_artifacts: PipelineArtifacts,
+}
+
+impl PostWriteContext {
+    pub fn artifact(&self, stage_id: &str, key: &str) -> Option<&ArtifactValue> {
+        self.pipeline_artifacts.get(stage_id, key)
     }
 }

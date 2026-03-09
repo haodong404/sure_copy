@@ -131,10 +131,7 @@ impl TaskOrchestrator for InMemoryTaskOrchestrator {
 
         for handle in handles {
             let state = handle.state().await?;
-            if state != TaskState::Cancelled
-                && state != TaskState::Completed
-                && state != TaskState::Failed
-            {
+            if !state.is_terminal() {
                 handle.cancel().await?;
             }
         }

@@ -40,7 +40,7 @@ mod tests {
     use super::*;
     use crate::domain::{CopyTask, TaskOptions, TaskProgress, TaskState};
     use crate::orchestrator::TaskUpdate;
-    use crate::pipeline::{Pipeline, PipelineKind, PreCopyPipelineMode, StageExecution};
+    use crate::pipeline::{PostWritePipelineMode, SourcePipelineMode, TaskFlowPlan};
     use async_trait::async_trait;
     use std::sync::Arc;
     use tokio::sync::broadcast;
@@ -164,21 +164,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn facade_submit_returns_task_handle() {
         let api = SureCopyCoreApi::new(Arc::new(StubOrchestrator));
-        let pre = Arc::new(Pipeline::new(
-            PipelineKind::PreCopy,
-            StageExecution::Parallel,
-            vec![],
-        ));
         let task = CopyTask::new(
             "task-001",
             PathBuf::from("/src"),
             vec![PathBuf::from("/dst")],
             TaskOptions::default(),
         )
-        .with_pipelines(
-            crate::pipeline::TaskPipelinePlan::new()
-                .with_pre_copy_pipeline(pre)
-                .with_pre_copy_mode(PreCopyPipelineMode::ConcurrentWithCopy),
+        .with_flow(
+            TaskFlowPlan::new().with_source_pipeline_mode(SourcePipelineMode::SerialBeforeFanOut),
         );
 
         let handle = api
@@ -188,8 +181,12 @@ mod tests {
         assert_eq!(handle.snapshot().id, "task-001");
         assert_eq!(handle.id(), "task-001");
         assert_eq!(
-            handle.snapshot().pipelines.pre_copy_mode,
-            PreCopyPipelineMode::ConcurrentWithCopy
+            handle.snapshot().flow.source_pipeline_mode(),
+            SourcePipelineMode::SerialBeforeFanOut
+        );
+        assert_eq!(
+            handle.snapshot().flow.post_write_pipeline_mode(),
+            PostWritePipelineMode::SerialAfterWrite
         );
     }
 

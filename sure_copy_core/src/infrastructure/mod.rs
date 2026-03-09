@@ -31,9 +31,18 @@ pub trait FileSystem: Send + Sync {
 pub trait ChecksumProvider: Send + Sync {
     fn algorithm(&self) -> &'static str;
 
+    fn begin_stream(&self) -> Result<Box<dyn StreamingChecksum>, CopyError> {
+        Err(CopyError::not_implemented("ChecksumProvider::begin_stream"))
+    }
+
     async fn checksum_file(&self, _path: &Path) -> Result<String, CopyError> {
         Err(CopyError::not_implemented(
             "ChecksumProvider::checksum_file",
         ))
     }
+}
+
+pub trait StreamingChecksum: Send {
+    fn update(&mut self, chunk: &[u8]);
+    fn finalize(self: Box<Self>) -> String;
 }

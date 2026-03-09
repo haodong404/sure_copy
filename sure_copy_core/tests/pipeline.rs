@@ -1,276 +1,182 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use sure_copy_core::pipeline::NoopStage;
-use sure_copy_core::{
-    BoxStageStream, CopyError, CopyTask, FilePlan, InMemoryStageStream, Pipeline, PipelineKind,
-    PreCopyPipelineMode, ProcessingStage, StageCapability, StageChunk, StageExecution,
-    StageExecutionHint, StageId, StageNode, StageStream, TaskOptions, TaskPipelinePlan, TaskState,
+use async_trait::async_trait;
+use sure_copy_core::pipeline::{
+    NoopPostWriteStage, NoopSourceObserverStage, PipelineArtifacts, PostWriteContext,
+    PostWritePipeline, PostWritePipelineMode, PostWriteStage, SourceChunk, SourceObserverPipeline,
+    SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId, TaskFlowPlan,
 };
+use sure_copy_core::{CopyError, CopyTask, FilePlan, TaskOptions};
 
-struct DummyStage;
+#[derive(Default)]
+struct CountingObserverStage {
+    seen_bytes: Mutex<u64>,
+}
 
-impl ProcessingStage for DummyStage {
+#[async_trait]
+impl SourceObserverStage for CountingObserverStage {
     fn id(&self) -> StageId {
-        "dummy"
+        "counting-observer"
     }
 
-    fn capability(&self) -> StageCapability {
-        StageCapability {
-            parallelizable: true,
-            output_size_changing: false,
-            reversible: false,
-            cpu_intensive: false,
-        }
-    }
-}
-
-#[test]
-fn can_build_pipeline_with_parallel_group() {
-    let stages = vec![StageNode::Stage(Box::new(DummyStage))];
-    let pipeline = Pipeline::new(PipelineKind::PreCopy, StageExecution::Parallel, stages);
-
-    assert_eq!(pipeline.kind, PipelineKind::PreCopy);
-    match pipeline.root {
-        StageNode::Group {
-            execution,
-            children,
-        } => {
-            assert_eq!(execution, StageExecution::Parallel);
-            assert_eq!(children.len(), 1);
-        }
-        StageNode::Stage(_) => panic!("expected group root"),
-    }
-}
-
-#[test]
-fn execution_hint_defaults_to_io_bound_for_non_cpu_stage() {
-    let stage = DummyStage;
-    assert_eq!(stage.execution_hint(), StageExecutionHint::IoBound);
-}
-
-struct CpuHeavyStage;
-
-impl ProcessingStage for CpuHeavyStage {
-    fn id(&self) -> StageId {
-        "cpu-heavy"
-    }
-
-    fn capability(&self) -> StageCapability {
-        StageCapability {
-            parallelizable: true,
-            output_size_changing: false,
-            reversible: false,
-            cpu_intensive: true,
-        }
-    }
-}
-
-#[test]
-fn execution_hint_is_cpu_bound_for_cpu_intensive_stage() {
-    let stage = CpuHeavyStage;
-    assert_eq!(stage.execution_hint(), StageExecutionHint::CpuBound);
-}
-
-#[test]
-fn task_pipeline_plan_defaults_to_serial_pre_copy_mode() {
-    let plan = TaskPipelinePlan::default();
-    assert!(plan.pre_copy_pipeline.is_none());
-    assert!(plan.post_copy_pipeline.is_none());
-    assert_eq!(plan.pre_copy_mode, PreCopyPipelineMode::SerialBeforeCopy);
-}
-
-#[test]
-fn task_pipeline_plan_can_be_customized_at_creation() {
-    let pre = Arc::new(Pipeline::new(
-        PipelineKind::PreCopy,
-        StageExecution::Parallel,
-        vec![StageNode::Stage(Box::new(DummyStage))],
-    ));
-    let post = Arc::new(Pipeline::new(
-        PipelineKind::PostCopy,
-        StageExecution::Serial,
-        vec![StageNode::Stage(Box::new(DummyStage))],
-    ));
-
-    let plan = TaskPipelinePlan::new()
-        .with_pre_copy_pipeline(pre)
-        .with_post_copy_pipeline(post)
-        .with_pre_copy_mode(PreCopyPipelineMode::ConcurrentWithCopy);
-
-    assert!(plan.pre_copy_pipeline.is_some());
-    assert!(plan.post_copy_pipeline.is_some());
-    assert_eq!(plan.pre_copy_mode, PreCopyPipelineMode::ConcurrentWithCopy);
-}
-
-struct UppercaseStage;
-
-#[async_trait::async_trait]
-impl ProcessingStage for UppercaseStage {
-    fn id(&self) -> StageId {
-        "uppercase"
-    }
-
-    fn capability(&self) -> StageCapability {
-        StageCapability {
-            parallelizable: true,
-            output_size_changing: false,
-            reversible: false,
-            cpu_intensive: false,
-        }
-    }
-
-    async fn execute_stream(
+    async fn observe_chunk(
         &self,
         _task: &CopyTask,
         _plan: &FilePlan,
-        mut input: Option<BoxStageStream>,
-    ) -> Result<BoxStageStream, CopyError> {
-        let mut out = Vec::new();
-        let input = input
-            .as_mut()
-            .ok_or_else(|| CopyError::not_implemented("UppercaseStage::requires_input"))?;
-
-        while let Some(item) = input.next().await {
-            let mut chunk = item?;
-            chunk.bytes = chunk.bytes.iter().map(|b| b.to_ascii_uppercase()).collect();
-            out.push(Ok(chunk));
-        }
-
-        Ok(Box::new(InMemoryStageStream::new(out)))
-    }
-}
-
-struct PrefixStage;
-
-#[async_trait::async_trait]
-impl ProcessingStage for PrefixStage {
-    fn id(&self) -> StageId {
-        "prefix"
+        chunk: &SourceChunk,
+    ) -> Result<(), CopyError> {
+        let mut seen = self.seen_bytes.lock().expect("lock should not be poisoned");
+        *seen += chunk.len() as u64;
+        Ok(())
     }
 
-    fn capability(&self) -> StageCapability {
-        StageCapability {
-            parallelizable: true,
-            output_size_changing: true,
-            reversible: false,
-            cpu_intensive: false,
-        }
-    }
-
-    async fn execute_stream(
+    async fn finish(
         &self,
         _task: &CopyTask,
         _plan: &FilePlan,
-        mut input: Option<BoxStageStream>,
-    ) -> Result<BoxStageStream, CopyError> {
-        let mut out = Vec::new();
-        let input = input
-            .as_mut()
-            .ok_or_else(|| CopyError::not_implemented("PrefixStage::requires_input"))?;
-
-        while let Some(item) = input.next().await {
-            let mut chunk = item?;
-            let mut prefixed = b"P:".to_vec();
-            prefixed.extend(chunk.bytes);
-            chunk.bytes = prefixed;
-            out.push(Ok(chunk));
-        }
-
-        Ok(Box::new(InMemoryStageStream::new(out)))
+    ) -> Result<StageArtifacts, CopyError> {
+        let seen = *self.seen_bytes.lock().expect("lock should not be poisoned");
+        Ok(StageArtifacts::new().with_value("seen_bytes", seen.to_string()))
     }
 }
 
-async fn collect_stream(mut stream: BoxStageStream) -> Result<Vec<StageChunk>, CopyError> {
-    let mut chunks = Vec::new();
-    while let Some(item) = stream.next().await {
-        chunks.push(item?);
+#[derive(Default)]
+struct RecordingPostWriteStage {
+    invocations: Mutex<Vec<(PathBuf, u64)>>,
+}
+
+#[async_trait]
+impl PostWriteStage for RecordingPostWriteStage {
+    fn id(&self) -> StageId {
+        "recording-post-write"
     }
-    Ok(chunks)
+
+    async fn execute(&self, ctx: &PostWriteContext) -> Result<StageArtifacts, CopyError> {
+        self.invocations
+            .lock()
+            .expect("lock should not be poisoned")
+            .push((ctx.actual_destination_path.clone(), ctx.bytes_written));
+        Ok(StageArtifacts::new().with_value("post_write", "ran"))
+    }
+}
+
+#[test]
+fn flow_plan_defaults_to_streaming_source_mode() {
+    let flow = TaskFlowPlan::default();
+    assert!(flow.source_observer.is_none());
+    assert!(flow.post_write.is_none());
+    assert_eq!(
+        flow.source_pipeline_mode(),
+        SourcePipelineMode::ConcurrentWithFanOut
+    );
+    assert_eq!(
+        flow.post_write_pipeline_mode(),
+        PostWritePipelineMode::SerialAfterWrite
+    );
+}
+
+#[test]
+fn flow_plan_tracks_runtime_stage_attachments() {
+    let flow = TaskFlowPlan::new()
+        .with_source_observer(
+            SourceObserverPipeline::new(SourcePipelineMode::SerialBeforeFanOut)
+                .with_stage(Arc::new(CountingObserverStage::default())),
+        )
+        .with_post_write(
+            PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite)
+                .with_stage(Arc::new(RecordingPostWriteStage::default())),
+        );
+
+    assert!(flow.has_runtime_stages());
+    assert_eq!(
+        flow.source_pipeline_mode(),
+        SourcePipelineMode::SerialBeforeFanOut
+    );
+    assert_eq!(
+        flow.post_write_pipeline_mode(),
+        PostWritePipelineMode::SerialAfterWrite
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn serial_stage_can_stream_from_previous_stage_output() {
-    let task = CopyTask {
-        id: "task-001".to_string(),
-        source_root: PathBuf::from("/src"),
-        destinations: vec![PathBuf::from("/dst")],
-        options: TaskOptions::default(),
-        pipelines: TaskPipelinePlan::default(),
-        state: TaskState::Created,
-        file_plans: vec![],
-    };
+async fn source_observer_stage_can_collect_chunk_artifacts() {
+    let stage = CountingObserverStage::default();
+    let task = CopyTask::new(
+        "task-observer",
+        PathBuf::from("/src"),
+        vec![PathBuf::from("/dst")],
+        TaskOptions::default(),
+    );
     let plan = FilePlan {
         source: PathBuf::from("/src/file.txt"),
         destinations: vec![PathBuf::from("/dst/file.txt")],
-        expected_size_bytes: None,
+        expected_size_bytes: Some(8),
         expected_checksum: None,
     };
 
-    let seed_stream = InMemoryStageStream::new(vec![
-        Ok(StageChunk {
-            bytes: b"hello".to_vec(),
-            metadata: vec![],
-        }),
-        Ok(StageChunk {
-            bytes: b"world".to_vec(),
-            metadata: vec![],
-        }),
-    ]);
-
-    let uppercase = UppercaseStage;
-    let prefix = PrefixStage;
-
-    let stage1_out = uppercase
-        .execute_stream(&task, &plan, Some(Box::new(seed_stream)))
+    stage
+        .observe_chunk(
+            &task,
+            &plan,
+            &SourceChunk {
+                offset: 0,
+                bytes: Arc::<[u8]>::from(&b"hello"[..]),
+            },
+        )
         .await
-        .expect("stage1 should process stream");
-    let stage2_out = prefix
-        .execute_stream(&task, &plan, Some(stage1_out))
+        .expect("observer should accept first chunk");
+    stage
+        .observe_chunk(
+            &task,
+            &plan,
+            &SourceChunk {
+                offset: 5,
+                bytes: Arc::<[u8]>::from(&b"rust"[..]),
+            },
+        )
         .await
-        .expect("stage2 should read stage1 stream");
+        .expect("observer should accept second chunk");
 
-    let out = collect_stream(stage2_out)
+    let artifacts = stage
+        .finish(&task, &plan)
         .await
-        .expect("should collect final output");
-    let payloads: Vec<Vec<u8>> = out.into_iter().map(|c| c.bytes).collect();
-
-    assert_eq!(payloads, vec![b"P:HELLO".to_vec(), b"P:WORLD".to_vec()]);
+        .expect("finish should work");
+    assert_eq!(artifacts.get_string("seen_bytes"), Some("9"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn in_memory_stage_stream_is_fifo_and_exhaustible() {
-    let mut stream = InMemoryStageStream::new(vec![
-        Ok(StageChunk {
-            bytes: b"a".to_vec(),
-            metadata: vec![("k1".to_string(), "v1".to_string())],
-        }),
-        Ok(StageChunk {
-            bytes: b"b".to_vec(),
-            metadata: vec![("k2".to_string(), "v2".to_string())],
-        }),
-    ]);
+async fn post_write_stage_receives_destination_context() {
+    let stage = RecordingPostWriteStage::default();
+    let mut pipeline_artifacts = PipelineArtifacts::new();
+    pipeline_artifacts.insert_stage_output(
+        "builtin-source-hash",
+        StageArtifacts::new().with_value("checksum", "abc"),
+    );
+    let ctx = PostWriteContext {
+        task_id: "task-post-write".to_string(),
+        source_path: PathBuf::from("/src/file.txt"),
+        requested_destination_path: PathBuf::from("/dst/file.txt"),
+        actual_destination_path: PathBuf::from("/dst/file (1).txt"),
+        bytes_written: 128,
+        expected_bytes: 128,
+        pipeline_artifacts,
+    };
 
-    let first = stream
-        .next()
-        .await
-        .expect("first item should exist")
-        .expect("first item should be ok");
-    let second = stream
-        .next()
-        .await
-        .expect("second item should exist")
-        .expect("second item should be ok");
-    let end = stream.next().await;
-
-    assert_eq!(first.bytes, b"a".to_vec());
-    assert_eq!(second.bytes, b"b".to_vec());
-    assert!(end.is_none());
+    let artifacts = stage.execute(&ctx).await.expect("execute should work");
+    assert_eq!(artifacts.get_string("post_write"), Some("ran"));
+    assert_eq!(
+        stage
+            .invocations
+            .lock()
+            .expect("lock should not be poisoned")
+            .as_slice(),
+        &[(PathBuf::from("/dst/file (1).txt"), 128)]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn noop_stage_passes_through_input_stream() {
-    let stage = NoopStage;
+async fn noop_stages_are_safe_defaults() {
     let task = CopyTask::new(
         "task-noop",
         PathBuf::from("/src"),
@@ -280,46 +186,46 @@ async fn noop_stage_passes_through_input_stream() {
     let plan = FilePlan {
         source: PathBuf::from("/src/file.txt"),
         destinations: vec![PathBuf::from("/dst/file.txt")],
-        expected_size_bytes: None,
+        expected_size_bytes: Some(4),
         expected_checksum: None,
     };
 
-    let input = InMemoryStageStream::new(vec![Ok(StageChunk {
-        bytes: b"noop".to_vec(),
-        metadata: vec![("k".to_string(), "v".to_string())],
-    })]);
-
-    let out = stage
-        .execute_stream(&task, &plan, Some(Box::new(input)))
+    NoopSourceObserverStage
+        .observe_chunk(
+            &task,
+            &plan,
+            &SourceChunk {
+                offset: 0,
+                bytes: Arc::<[u8]>::from(&b"noop"[..]),
+            },
+        )
         .await
-        .expect("noop should pass through");
-    let chunks = collect_stream(out).await.expect("should collect output");
-
-    assert_eq!(chunks.len(), 1);
-    assert_eq!(chunks[0].bytes, b"noop".to_vec());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn noop_stage_without_input_returns_empty_stream() {
-    let stage = NoopStage;
-    let task = CopyTask::new(
-        "task-noop-empty",
-        PathBuf::from("/src"),
-        vec![PathBuf::from("/dst")],
-        TaskOptions::default(),
+        .expect("noop observer should accept chunks");
+    assert_eq!(
+        NoopSourceObserverStage
+            .finish(&task, &plan)
+            .await
+            .expect("noop observer should finish")
+            .values
+            .is_empty(),
+        true
     );
-    let plan = FilePlan {
-        source: PathBuf::from("/src/file.txt"),
-        destinations: vec![PathBuf::from("/dst/file.txt")],
-        expected_size_bytes: None,
-        expected_checksum: None,
-    };
 
-    let out = stage
-        .execute_stream(&task, &plan, None)
-        .await
-        .expect("noop should handle none input");
-    let chunks = collect_stream(out).await.expect("should collect output");
-
-    assert!(chunks.is_empty());
+    assert_eq!(
+        NoopPostWriteStage
+            .execute(&PostWriteContext {
+                task_id: "task-noop".to_string(),
+                source_path: PathBuf::from("/src/file.txt"),
+                requested_destination_path: PathBuf::from("/dst/file.txt"),
+                actual_destination_path: PathBuf::from("/dst/file.txt"),
+                bytes_written: 4,
+                expected_bytes: 4,
+                pipeline_artifacts: PipelineArtifacts::default(),
+            })
+            .await
+            .expect("noop post-write should execute")
+            .values
+            .is_empty(),
+        true
+    );
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use tokio::sync::broadcast;
 
-use crate::domain::{CopyError, CopyReport, CopyTask, TaskProgress, TaskState};
+use crate::domain::{CopyError, CopyReport, CopyTask, DestinationReport, TaskProgress, TaskState};
 
 use super::errors::{invalid_state_error, lock_poisoned_error};
 
@@ -103,6 +103,7 @@ impl InMemoryTask {
             duration_ms: 0,
             retry_count: 0,
             failures: Vec::new(),
+            destinations: Vec::<DestinationReport>::new(),
         }
     }
 }
@@ -110,7 +111,7 @@ impl InMemoryTask {
 /// Task handle returned by orchestrator submission and lookup APIs.
 #[async_trait]
 pub trait Task: Send + Sync {
-    /// Returns task runtime snapshot including pipeline plan.
+    /// Returns task runtime snapshot including flow attachments.
     ///
     /// This replaces the older `config()` naming.
     fn snapshot(&self) -> CopyTask;

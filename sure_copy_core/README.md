@@ -9,7 +9,7 @@
 - `TaskOrchestrator` implementations for ephemeral and durable runtimes.
 - `Task` handles for running, pausing, resuming, cancelling, and observing tasks.
 - `TaskUpdate` streams for UI progress.
-- Pipeline traits for stage-based preprocessing and postprocessing.
+- Flow traits for source-side observers and per-destination post-write stages.
 
 ## Quick Start
 
@@ -143,6 +143,7 @@ Exceptional branches:
 
 - `Created -> Cancelled`
 - `Planned -> Cancelled`
+- `Running -> PartialFailed`
 - `Running -> Failed`
 - `Running -> Cancelled`
 - `Running -> Paused`
@@ -188,22 +189,23 @@ This layer owns execution and durability.
 - `SqliteTaskOrchestrator`: durable runtime with checkpoint persistence and startup recovery.
 - `Task`: the task handle interface returned to callers.
 
-`PersistentTask` is the core of the durable flow. It seeds checkpoints, applies overwrite policy, performs copy and checksum verification, refreshes progress, and persists state transitions.
+`PersistentTask` is the core of the durable flow. It groups work per source file, fans one reader out to multiple destination writers, runs source-side observers, executes per-destination post-write verification, refreshes progress, and persists state transitions.
 
 ### `pipeline`
 
-This layer defines the processing-stage contracts:
+This layer defines the flow contracts:
 
-- `ProcessingStage`
-- `StageStream`
-- `Pipeline`
-- `TaskPipelinePlan`
+- `SourceObserverStage`
+- `PostWriteStage`
+- `SourceObserverPipeline`
+- `PostWritePipeline`
+- `TaskFlowPlan`
 
-The current runtime support is intentionally conservative:
+The durable runtime support is intentionally conservative:
 
-- Serial stage streaming is the supported execution model today.
-- Durable SQLite tasks reject custom pipelines because those stage graphs are not yet persisted safely.
-- `PreCopyPipelineMode::ConcurrentWithCopy` is reserved for a future runtime with real concurrent topology execution.
+- `SourcePipelineMode` controls whether source observers run before fan-out or during fan-out.
+- `PostWritePipelineMode::SerialAfterWrite` runs after each destination write completes.
+- Durable SQLite tasks reject custom runtime stages because trait-object stages are not yet persisted safely.
 
 ### `infrastructure`
 
@@ -221,10 +223,10 @@ The durable runtime depends on these abstractions rather than hard-coding every 
 The crate is usable today, but it is important to understand the current boundaries:
 
 - SQLite-backed tasks persist task specs, task state, and file checkpoints.
-- Resume works at checkpoint granularity, not byte-range partial copy granularity.
+- Resume works at file/destination checkpoint granularity, not byte-range partial copy granularity.
 - Rename overwrite mode records the actual destination path in checkpoints.
 - Progress is computed from checkpoint `expected_bytes`, so totals stay stable during resume.
-- Custom pipeline execution is not yet supported by the durable orchestrator.
+- Custom runtime stage execution is not yet supported by the durable SQLite orchestrator.
 - The in-memory orchestrator is intentionally simpler and does not aim to mirror every durability concern.
 
 ## Suggested Integration Pattern
@@ -255,6 +257,12 @@ Run them with:
 cargo test -p sure_copy_core
 ```
 
+Run the benchmark suite with:
+
+```bash
+cargo bench -p sure_copy_core
+```
+
 ## Logging
 
 `sure_copy_core` emits runtime logs through the `log` facade. A host application or test binary can enable them with `env_logger`.
@@ -273,3 +281,14 @@ For local debugging, a useful default is:
 ```bash
 RUST_LOG=sure_copy_core=debug cargo test -p sure_copy_core -- --nocapture
 ```
+
+## Benchmarks
+
+The crate includes Criterion benchmarks under `sure_copy_core/benches/` for four high-value paths:
+
+- `checksum`: SHA-256 throughput on representative file sizes
+- `fs_walk`: recursive directory traversal throughput
+- `sqlite_recovery`: SQLite startup recovery latency as task and checkpoint counts grow
+- `persistent_copy`: end-to-end durable copy throughput for single-destination, multi-destination, and post-write verification workloads
+
+These benchmarks are designed for regression tracking more than absolute cross-machine comparison. Use the same machine, filesystem type, and dataset profile when comparing runs.
