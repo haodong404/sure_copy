@@ -98,3 +98,34 @@ impl FileSystem for LocalFileSystem {
         Ok(files)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_io_error_maps_permission_denied() {
+        let err = LocalFileSystem::map_io_error(
+            io::Error::new(ErrorKind::PermissionDenied, "nope"),
+            "create_dir_all",
+            Path::new("/restricted"),
+        );
+
+        assert_eq!(err.category, CopyErrorCategory::Permission);
+        assert_eq!(err.code, "PERMISSION_DENIED");
+        assert!(err.message.contains("/restricted"));
+    }
+
+    #[test]
+    fn map_io_error_maps_generic_io_errors() {
+        let err = LocalFileSystem::map_io_error(
+            io::Error::other("boom"),
+            "read_dir",
+            Path::new("/tmp/data"),
+        );
+
+        assert_eq!(err.category, CopyErrorCategory::Io);
+        assert_eq!(err.code, "IO_ERROR");
+        assert!(err.message.contains("read_dir"));
+    }
+}

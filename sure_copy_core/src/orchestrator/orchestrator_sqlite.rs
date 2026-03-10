@@ -1,25 +1,31 @@
 use async_trait::async_trait;
+use globset::Glob;
 use log::{debug, info, warn};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::fs as std_fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock as AsyncRwLock;
 
-use crate::domain::{CopyError, CopyErrorCategory, CopyTask, TaskProgress, TaskSpec, TaskState};
+use crate::domain::{
+    CopyError, CopyErrorCategory, CopyTask, FilePlan, TaskProgress, TaskSpec, TaskState,
+};
 use crate::infrastructure::{
     ChecksumProvider, FileSystem, LocalFileSystem, Sha256ChecksumProvider,
 };
+use crate::pipeline::StageRegistry;
 
 use super::artifact_store::ArtifactStore;
 use super::config::OrchestratorConfig;
-use super::errors::{duplicate_task_error, task_not_found_error, unsupported_feature_error};
+use super::errors::{duplicate_task_error, task_not_found_error};
 use super::persistent_task::PersistentTask;
 use super::sqlite_artifact_store::{
     SqliteArtifactStore, TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL, TASK_SOURCE_ARTIFACTS_SCHEMA_SQL,
+    TASK_STAGE_STATES_SCHEMA_SQL,
 };
 use super::task::{Task, TaskOrchestrator};
 
@@ -29,9 +35,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     source_root TEXT NOT NULL,
     destinations_json TEXT NOT NULL,
     spec_json TEXT NOT NULL DEFAULT '{}',
+    file_plans_json TEXT NOT NULL DEFAULT '[]',
     state TEXT NOT NULL,
     total_bytes INTEGER NOT NULL DEFAULT 0,
-    complete_bytes INTEGER NOT NULL DEFAULT 0
+    complete_bytes INTEGER NOT NULL DEFAULT 0,
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    started_at_ms INTEGER,
+    finished_at_ms INTEGER
 );
 "#;
 
@@ -54,6 +64,12 @@ CREATE TABLE IF NOT EXISTS task_file_checkpoints (
 
 const TASKS_SPEC_JSON_MIGRATION_SQL: &str =
     "ALTER TABLE tasks ADD COLUMN spec_json TEXT NOT NULL DEFAULT '{}'";
+const TASKS_FILE_PLANS_JSON_MIGRATION_SQL: &str =
+    "ALTER TABLE tasks ADD COLUMN file_plans_json TEXT NOT NULL DEFAULT '[]'";
+const TASKS_RETRY_COUNT_MIGRATION_SQL: &str =
+    "ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0";
+const TASKS_STARTED_AT_MIGRATION_SQL: &str = "ALTER TABLE tasks ADD COLUMN started_at_ms INTEGER";
+const TASKS_FINISHED_AT_MIGRATION_SQL: &str = "ALTER TABLE tasks ADD COLUMN finished_at_ms INTEGER";
 const TASK_FILE_CHECKPOINTS_EXPECTED_BYTES_MIGRATION_SQL: &str =
     "ALTER TABLE task_file_checkpoints ADD COLUMN expected_bytes INTEGER NOT NULL DEFAULT 0";
 const TASK_FILE_CHECKPOINTS_ACTUAL_DESTINATION_MIGRATION_SQL: &str =
@@ -116,11 +132,100 @@ fn map_submit_error(task_id: &str, err: sqlx::Error) -> CopyError {
     db_error("SqliteTaskOrchestrator::submit", err)
 }
 
+fn normalize_path_for_validation(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+
+    normalized
+}
+
+fn is_same_or_nested_path(lhs: &Path, rhs: &Path) -> bool {
+    lhs == rhs || lhs.starts_with(rhs) || rhs.starts_with(lhs)
+}
+
 fn validate_submitted_task(task: &CopyTask) -> Result<(), CopyError> {
-    if task.flow.has_runtime_stages() {
-        return Err(unsupported_feature_error(
-            "durable custom runtime stages for SQLite-backed tasks",
-        ));
+    if task.id.trim().is_empty() {
+        return Err(CopyError {
+            category: CopyErrorCategory::Path,
+            code: "TASK_ID_EMPTY",
+            message: "task id must not be empty".to_string(),
+        });
+    }
+
+    if task.destinations.is_empty() {
+        return Err(CopyError {
+            category: CopyErrorCategory::Path,
+            code: "DESTINATIONS_EMPTY",
+            message: format!("task '{}' must include at least one destination", task.id),
+        });
+    }
+
+    let normalized_source = normalize_path_for_validation(&task.source_root);
+    if normalized_source.as_os_str().is_empty() {
+        return Err(CopyError {
+            category: CopyErrorCategory::Path,
+            code: "SOURCE_ROOT_EMPTY",
+            message: format!("task '{}' must include a non-empty source root", task.id),
+        });
+    }
+
+    let mut unique_destinations = std::collections::HashSet::new();
+    for destination in &task.destinations {
+        let normalized_destination = normalize_path_for_validation(destination);
+        if normalized_destination.as_os_str().is_empty() {
+            return Err(CopyError {
+                category: CopyErrorCategory::Path,
+                code: "DESTINATION_EMPTY",
+                message: format!("task '{}' contains an empty destination path", task.id),
+            });
+        }
+
+        let key = normalized_destination.to_string_lossy().to_string();
+        if !unique_destinations.insert(key.clone()) {
+            return Err(CopyError {
+                category: CopyErrorCategory::Path,
+                code: "DUPLICATE_DESTINATION",
+                message: format!(
+                    "task '{}' contains duplicate destination '{}'",
+                    task.id, key
+                ),
+            });
+        }
+
+        if is_same_or_nested_path(&normalized_source, &normalized_destination) {
+            return Err(CopyError {
+                category: CopyErrorCategory::Path,
+                code: "OVERLAPPING_SOURCE_DESTINATION",
+                message: format!(
+                    "task '{}' source '{}' overlaps destination '{}'",
+                    task.id,
+                    normalized_source.display(),
+                    normalized_destination.display()
+                ),
+            });
+        }
+    }
+
+    for pattern in task
+        .options
+        .include_patterns
+        .iter()
+        .chain(task.options.exclude_patterns.iter())
+    {
+        Glob::new(pattern).map_err(|err| CopyError {
+            category: CopyErrorCategory::Path,
+            code: "INVALID_GLOB_PATTERN",
+            message: format!("invalid glob pattern '{}': {}", pattern, err),
+        })?;
     }
 
     Ok(())
@@ -156,6 +261,7 @@ fn state_to_db_value(state: TaskState) -> &'static str {
     match state {
         TaskState::Created => "created",
         TaskState::Planned => "planned",
+        TaskState::Preparing => "preparing",
         TaskState::Running => "running",
         TaskState::Completed => "completed",
         TaskState::PartialFailed => "partial_failed",
@@ -169,6 +275,7 @@ fn state_from_db_value(value: &str) -> Option<TaskState> {
     match value {
         "created" => Some(TaskState::Created),
         "planned" => Some(TaskState::Planned),
+        "preparing" => Some(TaskState::Preparing),
         "running" => Some(TaskState::Running),
         "completed" => Some(TaskState::Completed),
         "partial_failed" => Some(TaskState::PartialFailed),
@@ -203,11 +310,32 @@ fn decode_destinations(destinations_json: &str) -> Result<Vec<PathBuf>, CopyErro
     Ok(values.into_iter().map(PathBuf::from).collect())
 }
 
+fn encode_file_plans(file_plans: &[FilePlan]) -> Result<String, CopyError> {
+    serde_json::to_string(file_plans).map_err(|err| CopyError {
+        category: CopyErrorCategory::Io,
+        code: "SERDE_ERROR",
+        message: format!("failed to encode file plans: {}", err),
+    })
+}
+
+fn decode_file_plans(file_plans_json: &str) -> Result<Vec<FilePlan>, CopyError> {
+    if file_plans_json.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    serde_json::from_str::<Vec<FilePlan>>(file_plans_json).map_err(|err| CopyError {
+        category: CopyErrorCategory::Io,
+        code: "SERDE_ERROR",
+        message: format!("failed to decode file plans: {}", err),
+    })
+}
+
 struct DbTaskRow {
     id: String,
     source_root: String,
     destinations_json: String,
     spec_json: String,
+    file_plans_json: String,
     state: String,
     total_bytes: i64,
     complete_bytes: i64,
@@ -237,7 +365,10 @@ fn task_from_row(row: DbTaskRow) -> Result<(CopyTask, TaskProgress), CopyError> 
     })?;
 
     let spec = decode_task_spec(&row)?;
-    let task = CopyTask::from_spec(row.id, spec).with_state(state);
+    let file_plans = decode_file_plans(&row.file_plans_json)?;
+    let task = CopyTask::from_spec(row.id, spec)
+        .with_state(state)
+        .with_file_plans(file_plans);
 
     let progress = TaskProgress {
         total_bytes: row.total_bytes.max(0) as u64,
@@ -256,6 +387,7 @@ pub struct SqliteTaskOrchestrator {
     file_system: Arc<dyn FileSystem>,
     checksum_provider: Arc<dyn ChecksumProvider>,
     artifact_store: Arc<dyn ArtifactStore>,
+    stage_registry: Option<Arc<dyn StageRegistry>>,
 }
 
 impl SqliteTaskOrchestrator {
@@ -263,6 +395,16 @@ impl SqliteTaskOrchestrator {
     pub async fn new(
         database_path: impl AsRef<Path>,
         config: OrchestratorConfig,
+    ) -> Result<Self, CopyError> {
+        Self::new_with_stage_registry(database_path, config, None).await
+    }
+
+    /// Creates a SQLite orchestrator that can rebuild runtime stages from
+    /// durably persisted stage specs.
+    pub async fn new_with_stage_registry(
+        database_path: impl AsRef<Path>,
+        config: OrchestratorConfig,
+        stage_registry: Option<Arc<dyn StageRegistry>>,
     ) -> Result<Self, CopyError> {
         let database_path = database_path.as_ref();
         info!(
@@ -289,6 +431,30 @@ impl SqliteTaskOrchestrator {
             &pool,
             TASKS_SPEC_JSON_MIGRATION_SQL,
             "SqliteTaskOrchestrator::migrate_tasks_spec_json",
+        )
+        .await?;
+        apply_best_effort_migration(
+            &pool,
+            TASKS_FILE_PLANS_JSON_MIGRATION_SQL,
+            "SqliteTaskOrchestrator::migrate_tasks_file_plans_json",
+        )
+        .await?;
+        apply_best_effort_migration(
+            &pool,
+            TASKS_RETRY_COUNT_MIGRATION_SQL,
+            "SqliteTaskOrchestrator::migrate_tasks_retry_count",
+        )
+        .await?;
+        apply_best_effort_migration(
+            &pool,
+            TASKS_STARTED_AT_MIGRATION_SQL,
+            "SqliteTaskOrchestrator::migrate_tasks_started_at_ms",
+        )
+        .await?;
+        apply_best_effort_migration(
+            &pool,
+            TASKS_FINISHED_AT_MIGRATION_SQL,
+            "SqliteTaskOrchestrator::migrate_tasks_finished_at_ms",
         )
         .await?;
 
@@ -333,6 +499,10 @@ impl SqliteTaskOrchestrator {
                     err,
                 )
             })?;
+        sqlx::query(TASK_STAGE_STATES_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .map_err(|err| db_error("SqliteTaskOrchestrator::new_stage_state_schema", err))?;
 
         let artifact_store: Arc<dyn ArtifactStore> =
             Arc::new(SqliteArtifactStore::new(pool.clone()));
@@ -344,6 +514,7 @@ impl SqliteTaskOrchestrator {
             file_system: Arc::new(LocalFileSystem::new()),
             checksum_provider: Arc::new(Sha256ChecksumProvider::new()),
             artifact_store,
+            stage_registry,
         };
 
         let recovered = orchestrator.recover_unfinished_tasks().await?;
@@ -360,9 +531,10 @@ impl SqliteTaskOrchestrator {
     /// Tasks in `Planned` or `Running` are moved to `Paused`, so callers can
     /// decide whether and when to resume.
     pub async fn recover_unfinished_tasks(&self) -> Result<u64, CopyError> {
-        let result = sqlx::query("UPDATE tasks SET state = ? WHERE state IN (?, ?)")
+        let result = sqlx::query("UPDATE tasks SET state = ? WHERE state IN (?, ?, ?)")
             .bind(state_to_db_value(TaskState::Paused))
             .bind(state_to_db_value(TaskState::Planned))
+            .bind(state_to_db_value(TaskState::Preparing))
             .bind(state_to_db_value(TaskState::Running))
             .execute(&self.pool)
             .await
@@ -403,7 +575,7 @@ impl SqliteTaskOrchestrator {
 
     async fn load_row_by_id(&self, task_id: &str) -> Result<DbTaskRow, CopyError> {
         let row = sqlx::query(
-            "SELECT id, source_root, destinations_json, spec_json, state, total_bytes, complete_bytes FROM tasks WHERE id = ?",
+            "SELECT id, source_root, destinations_json, spec_json, file_plans_json, state, total_bytes, complete_bytes FROM tasks WHERE id = ?",
         )
         .bind(task_id)
         .fetch_optional(&self.pool)
@@ -416,6 +588,7 @@ impl SqliteTaskOrchestrator {
             source_root: row.get::<String, _>("source_root"),
             destinations_json: row.get::<String, _>("destinations_json"),
             spec_json: row.get::<String, _>("spec_json"),
+            file_plans_json: row.get::<String, _>("file_plans_json"),
             state: row.get::<String, _>("state"),
             total_bytes: row.get::<i64, _>("total_bytes"),
             complete_bytes: row.get::<i64, _>("complete_bytes"),
@@ -424,7 +597,7 @@ impl SqliteTaskOrchestrator {
 
     async fn load_all_rows(&self) -> Result<Vec<DbTaskRow>, CopyError> {
         let rows = sqlx::query(
-            "SELECT id, source_root, destinations_json, spec_json, state, total_bytes, complete_bytes FROM tasks",
+            "SELECT id, source_root, destinations_json, spec_json, file_plans_json, state, total_bytes, complete_bytes FROM tasks",
         )
         .fetch_all(&self.pool)
         .await
@@ -437,6 +610,7 @@ impl SqliteTaskOrchestrator {
                 source_root: row.get::<String, _>("source_root"),
                 destinations_json: row.get::<String, _>("destinations_json"),
                 spec_json: row.get::<String, _>("spec_json"),
+                file_plans_json: row.get::<String, _>("file_plans_json"),
                 state: row.get::<String, _>("state"),
                 total_bytes: row.get::<i64, _>("total_bytes"),
                 complete_bytes: row.get::<i64, _>("complete_bytes"),
@@ -458,29 +632,45 @@ impl SqliteTaskOrchestrator {
             Arc::clone(&self.file_system),
             Arc::clone(&self.checksum_provider),
             Arc::clone(&self.artifact_store),
+            self.stage_registry.clone(),
         ));
 
         Ok(handle)
+    }
+
+    fn prepare_submitted_task(&self, task: CopyTask) -> Result<CopyTask, CopyError> {
+        if task.flow_spec.is_some() || !task.flow.has_runtime_stages() {
+            return Ok(task);
+        }
+
+        let flow_spec = task.flow.try_to_spec()?;
+        Ok(task.with_flow_spec(flow_spec.unwrap_or_default()))
     }
 }
 
 #[async_trait]
 impl TaskOrchestrator for SqliteTaskOrchestrator {
     async fn submit(&self, task: CopyTask) -> Result<Arc<dyn Task>, CopyError> {
+        let task = self.prepare_submitted_task(task)?;
         validate_submitted_task(&task)?;
         info!("submitting SQLite-backed task '{}'", task.id);
         let destinations_json = encode_destinations(&task.destinations)?;
         let spec_json = encode_task_spec(&task.spec())?;
+        let file_plans_json = encode_file_plans(&task.file_plans)?;
         sqlx::query(
-            "INSERT INTO tasks (id, source_root, destinations_json, spec_json, state, total_bytes, complete_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tasks (id, source_root, destinations_json, spec_json, file_plans_json, state, total_bytes, complete_bytes, retry_count, started_at_ms, finished_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&task.id)
         .bind(task.source_root.to_string_lossy().to_string())
         .bind(destinations_json)
         .bind(spec_json)
+        .bind(file_plans_json)
         .bind(state_to_db_value(task.state))
         .bind(0_i64)
         .bind(0_i64)
+        .bind(0_i64)
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
         .execute(&self.pool)
         .await
         .map_err(|err| map_submit_error(&task.id, err))?;
@@ -493,6 +683,7 @@ impl TaskOrchestrator for SqliteTaskOrchestrator {
             Arc::clone(&self.file_system),
             Arc::clone(&self.checksum_provider),
             Arc::clone(&self.artifact_store),
+            self.stage_registry.clone(),
         ));
 
         let mut tasks = self.tasks.write().await;
@@ -597,10 +788,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn validate_submitted_task_rejects_empty_task_id() {
+        let err = validate_submitted_task(&CopyTask::new(
+            "   ",
+            PathBuf::from("/src"),
+            vec![PathBuf::from("/dst")],
+            Default::default(),
+        ))
+        .expect_err("empty task id should be rejected");
+
+        assert_eq!(err.code, "TASK_ID_EMPTY");
+    }
+
+    #[test]
+    fn validate_submitted_task_rejects_empty_destinations() {
+        let err = validate_submitted_task(&CopyTask::new(
+            "task-empty-destinations",
+            PathBuf::from("/src"),
+            Vec::new(),
+            Default::default(),
+        ))
+        .expect_err("missing destinations should be rejected");
+
+        assert_eq!(err.code, "DESTINATIONS_EMPTY");
+    }
+
+    #[test]
+    fn validate_submitted_task_rejects_duplicate_destinations() {
+        let err = validate_submitted_task(&CopyTask::new(
+            "task-duplicate-destinations",
+            PathBuf::from("/src"),
+            vec![PathBuf::from("/dst"), PathBuf::from("/dst")],
+            Default::default(),
+        ))
+        .expect_err("duplicate destinations should be rejected");
+
+        assert_eq!(err.code, "DUPLICATE_DESTINATION");
+    }
+
+    #[test]
+    fn validate_submitted_task_rejects_empty_source_root() {
+        let err = validate_submitted_task(&CopyTask::new(
+            "task-empty-source",
+            PathBuf::new(),
+            vec![PathBuf::from("/dst")],
+            Default::default(),
+        ))
+        .expect_err("empty source root should be rejected");
+
+        assert_eq!(err.code, "SOURCE_ROOT_EMPTY");
+    }
+
+    #[test]
     fn state_mapping_roundtrip_is_stable() {
         let all = [
             TaskState::Created,
             TaskState::Planned,
+            TaskState::Preparing,
             TaskState::Running,
             TaskState::Completed,
             TaskState::PartialFailed,
@@ -628,6 +872,7 @@ mod tests {
             source_root: "/src".to_string(),
             destinations_json: "[\"/dst\"]".to_string(),
             spec_json: "{}".to_string(),
+            file_plans_json: "[]".to_string(),
             state: "created".to_string(),
             total_bytes: -10,
             complete_bytes: -3,

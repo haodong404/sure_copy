@@ -2,7 +2,9 @@ use async_trait::async_trait;
 
 use crate::domain::{CopyError, CopyTask, FilePlan, StageProgressStatus};
 
-use super::types::{PostWriteContext, SourceChunk, StageArtifacts, StageId};
+use super::types::{
+    PostWriteContext, SourceChunk, StageArtifacts, StageId, StageSpec, StageStateSpec,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRuntimeProgress {
@@ -24,6 +26,18 @@ impl StageRuntimeProgress {
 #[async_trait]
 pub trait SourceObserverStage: Send + Sync {
     fn id(&self) -> StageId;
+
+    fn spec(&self) -> Option<StageSpec> {
+        None
+    }
+
+    fn snapshot_state(&self) -> Option<StageStateSpec> {
+        None
+    }
+
+    fn restore_state(&self, _state: &StageStateSpec) -> Result<(), CopyError> {
+        Ok(())
+    }
 
     fn reset_progress(&self, _total_bytes: Option<u64>) {}
 
@@ -54,6 +68,18 @@ pub trait SourceObserverStage: Send + Sync {
 #[async_trait]
 pub trait PostWriteStage: Send + Sync {
     fn id(&self) -> StageId;
+
+    fn spec(&self) -> Option<StageSpec> {
+        None
+    }
+
+    fn snapshot_state(&self) -> Option<StageStateSpec> {
+        None
+    }
+
+    fn restore_state(&self, _state: &StageStateSpec) -> Result<(), CopyError> {
+        Ok(())
+    }
 
     fn reset_progress(&self, _total_bytes: Option<u64>) {}
 
@@ -141,6 +167,10 @@ mod tests {
         let observer = DefaultObserver;
         observer.reset_progress(Some(12));
         assert!(observer.progress_state().is_none());
+        assert!(observer.snapshot_state().is_none());
+        observer
+            .restore_state(&StageStateSpec::new("default-observer"))
+            .expect("default restore should be a no-op");
 
         let task = CopyTask::new(
             "default-stage",
@@ -171,6 +201,10 @@ mod tests {
         let post_write = DefaultPostWrite;
         post_write.reset_progress(Some(10));
         assert!(post_write.progress_state().is_none());
+        assert!(post_write.snapshot_state().is_none());
+        post_write
+            .restore_state(&StageStateSpec::new("default-post-write"))
+            .expect("default restore should be a no-op");
 
         let err = post_write
             .execute(&PostWriteContext {

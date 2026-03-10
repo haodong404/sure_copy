@@ -1,8 +1,18 @@
 use std::sync::Arc;
 
-use super::stage::{PostWriteStage, SourceObserverStage};
-use super::types::{PostWritePipelineMode, SourcePipelineMode};
+use crate::domain::CopyError;
 
+use super::stage::{PostWriteStage, SourceObserverStage};
+use super::types::{
+    PostWritePipelineMode, PostWritePipelineSpec, SourceObserverPipelineSpec, SourcePipelineMode,
+    TaskFlowSpec,
+};
+
+/// Runtime source-side observer pipeline.
+///
+/// This struct describes *how* source chunks are processed while a file is being
+/// copied: which observer stages are attached, and whether they run serially
+/// before fan-out or concurrently with destination writes.
 #[derive(Clone)]
 pub struct SourceObserverPipeline {
     pub mode: SourcePipelineMode,
@@ -36,6 +46,10 @@ impl SourceObserverPipeline {
     }
 }
 
+/// Runtime post-write pipeline executed per destination branch.
+///
+/// This struct holds the concrete post-write stages to run after one destination
+/// file has been written successfully, together with their scheduling mode.
 #[derive(Clone)]
 pub struct PostWritePipeline {
     pub mode: PostWritePipelineMode,
@@ -69,12 +83,24 @@ impl PostWritePipeline {
     }
 }
 
-/// Runtime-only task flow attachments plus their scheduling modes.
+/// Runtime execution-flow plan for one task.
+///
+/// `TaskFlowPlan` is control-plane orchestration: it describes *how* file copy work
+/// should flow through runtime pipeline stages. It is intentionally separate from
+/// `FilePlan`, which describes *what* concrete file work needs to be performed.
+///
+/// The embedded `*_pipeline_mode` fields serve as fallback mode storage even when a
+/// concrete runtime pipeline is absent, so task specs can preserve scheduling
+/// semantics without requiring stage instances to exist yet.
 #[derive(Clone)]
 pub struct TaskFlowPlan {
+    /// Optional source observer pipeline attached to the task runtime.
     pub source_observer: Option<SourceObserverPipeline>,
+    /// Optional post-write pipeline attached to the task runtime.
     pub post_write: Option<PostWritePipeline>,
+    /// Fallback source pipeline mode when no `SourceObserverPipeline` is attached.
     source_pipeline_mode: SourcePipelineMode,
+    /// Fallback post-write pipeline mode when no `PostWritePipeline` is attached.
     post_write_pipeline_mode: PostWritePipelineMode,
 }
 
@@ -144,5 +170,70 @@ impl TaskFlowPlan {
                 .post_write
                 .as_ref()
                 .is_some_and(|pipeline| !pipeline.is_empty())
+    }
+
+    pub fn try_to_spec(&self) -> Result<Option<TaskFlowSpec>, CopyError> {
+        let source_observer = self
+            .source_observer
+            .as_ref()
+            .map(|pipeline| {
+                let stages = pipeline
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        stage.spec().ok_or(CopyError {
+                            category: crate::domain::CopyErrorCategory::NotImplemented,
+                            code: "STAGE_SPEC_MISSING",
+                            message: format!(
+                                "source observer stage '{}' cannot be durably persisted because it does not expose a stage spec",
+                                stage.id()
+                            ),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(SourceObserverPipelineSpec {
+                    mode: pipeline.mode,
+                    stages,
+                })
+            })
+            .transpose()?;
+
+        let post_write = self
+            .post_write
+            .as_ref()
+            .map(|pipeline| {
+                let stages = pipeline
+                    .stages
+                    .iter()
+                    .map(|stage| {
+                        stage.spec().ok_or(CopyError {
+                            category: crate::domain::CopyErrorCategory::NotImplemented,
+                            code: "STAGE_SPEC_MISSING",
+                            message: format!(
+                                "post-write stage '{}' cannot be durably persisted because it does not expose a stage spec",
+                                stage.id()
+                            ),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                Ok(PostWritePipelineSpec {
+                    mode: pipeline.mode,
+                    stages,
+                })
+            })
+            .transpose()?;
+
+        let spec = TaskFlowSpec {
+            source_observer,
+            post_write,
+        };
+
+        if spec.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(spec))
+        }
     }
 }

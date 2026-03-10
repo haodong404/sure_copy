@@ -4,8 +4,10 @@ use std::time::{Duration, Instant};
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use sure_copy_core::{
-    CopyTask, OrchestratorConfig, SqliteTaskOrchestrator, TaskOptions, TaskOrchestrator,
-    VerificationPolicy,
+    infrastructure::Sha256ChecksumProvider, CopyTask, DestinationChecksumVerifyStage,
+    OrchestratorConfig, PostWritePipeline, PostWritePipelineMode, SourceHashStage,
+    SourceObserverPipeline, SourcePipelineMode, SqliteTaskOrchestrator, TaskFlowPlan, TaskOptions,
+    TaskOrchestrator,
 };
 
 use support::{build_runtime, create_file_tree, join_path, temp_dir};
@@ -17,40 +19,66 @@ fn persistent_copy_benchmark(c: &mut Criterion) {
     group.sample_size(10);
     group.warm_up_time(Duration::from_secs(1));
 
-    for (case_name, file_count, file_size_bytes, verification_policy, destination_count) in [
+    for (case_name, file_count, file_size_bytes, flow, destination_count) in [
         (
             "tiny_files_no_verify",
             1_000_usize,
             4 * 1024_usize,
-            VerificationPolicy::None,
+            TaskFlowPlan::new(),
             1_usize,
         ),
         (
             "tiny_files_post_copy",
             1_000_usize,
             4 * 1024_usize,
-            VerificationPolicy::PostWrite,
+            TaskFlowPlan::new().with_post_write(
+                PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite).with_stage(
+                    std::sync::Arc::new(DestinationChecksumVerifyStage::new(std::sync::Arc::new(
+                        Sha256ChecksumProvider::new(),
+                    ))),
+                ),
+            ),
             1_usize,
         ),
         (
             "large_files_no_verify",
             8_usize,
             8 * 1024 * 1024_usize,
-            VerificationPolicy::None,
+            TaskFlowPlan::new(),
             1_usize,
         ),
         (
             "large_files_post_copy",
             8_usize,
             8 * 1024 * 1024_usize,
-            VerificationPolicy::PostWrite,
+            TaskFlowPlan::new().with_post_write(
+                PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite).with_stage(
+                    std::sync::Arc::new(DestinationChecksumVerifyStage::new(std::sync::Arc::new(
+                        Sha256ChecksumProvider::new(),
+                    ))),
+                ),
+            ),
             1_usize,
         ),
         (
             "multi_dest_source_observer",
             128_usize,
             64 * 1024_usize,
-            VerificationPolicy::SourceHashAndPostWrite,
+            TaskFlowPlan::new()
+                .with_source_observer(
+                    SourceObserverPipeline::new(SourcePipelineMode::SerialBeforeFanOut).with_stage(
+                        std::sync::Arc::new(SourceHashStage::new(std::sync::Arc::new(
+                            Sha256ChecksumProvider::new(),
+                        ))),
+                    ),
+                )
+                .with_post_write(
+                    PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite).with_stage(
+                        std::sync::Arc::new(DestinationChecksumVerifyStage::new(
+                            std::sync::Arc::new(Sha256ChecksumProvider::new()),
+                        )),
+                    ),
+                ),
             2_usize,
         ),
     ] {
@@ -79,15 +107,13 @@ fn persistent_copy_benchmark(c: &mut Criterion) {
                             .await
                             .expect("persistent copy benchmark should initialize");
 
-                            let mut options = TaskOptions::default();
-                            options.verification_policy = verification_policy;
-
                             let task = CopyTask::new(
                                 format!("bench-copy-{case_name}-{iteration}"),
                                 source_root.clone(),
                                 destinations,
-                                options,
-                            );
+                                TaskOptions::default(),
+                            )
+                            .with_flow(flow.clone());
 
                             let handle = orchestrator
                                 .submit(task)

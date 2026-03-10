@@ -15,10 +15,12 @@ use sure_copy_core::pipeline::{
     SourceObserverPipeline, SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId,
     TaskFlowPlan,
 };
-use sure_copy_core::testing::create_sqlite_persistent_task;
+use sure_copy_core::testing::{
+    create_sqlite_persistent_task, create_sqlite_persistent_task_with_verification_stages,
+};
 use sure_copy_core::{
     CopyError, CopyTask, DestinationCopyStatus, DestinationPostWriteStatus, FilePlan,
-    OverwritePolicy, TaskOptions, TaskState, TaskUpdate, TransferPhase, VerificationPolicy,
+    OverwritePolicy, TaskOptions, TaskState, TaskUpdate, TransferPhase,
 };
 
 use common::{init_test_logging, unique_temp_dir, unique_temp_file};
@@ -151,8 +153,7 @@ async fn post_write_stage_artifacts_are_persisted_per_destination() {
     std::fs::write(source_root.join("file.txt"), "artifact payload")
         .expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
+    let options = TaskOptions::default();
 
     let harness = create_sqlite_persistent_task(
         "post-write-artifacts-task",
@@ -198,8 +199,7 @@ async fn source_observer_stage_artifacts_are_persisted_for_source_file() {
     let payload = "observer payload";
     std::fs::write(&source_path, payload).expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
+    let options = TaskOptions::default();
 
     let harness = create_sqlite_persistent_task(
         "source-observer-artifacts-task",
@@ -261,8 +261,7 @@ async fn basic_copy_copies_all_source_files_to_multiple_destinations() {
             .expect("source test file should be writable");
     }
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
+    let options = TaskOptions::default();
 
     let harness = create_sqlite_persistent_task(
         "basic-copy-multi-destination-task",
@@ -292,6 +291,43 @@ async fn basic_copy_copies_all_source_files_to_multiple_destinations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_task_filters_sources_with_include_and_exclude_patterns() {
+    let source_root = unique_temp_dir("persistent_task_pattern_filter_src");
+    let destination_root = unique_temp_dir("persistent_task_pattern_filter_dst");
+
+    write_text(&source_root.join("keep.txt"), "keep");
+    write_text(&source_root.join("skip.log"), "skip by include");
+    write_text(&source_root.join("ignored/nested.txt"), "skip by exclude");
+
+    let mut options = TaskOptions::default();
+    options.include_patterns = vec!["**/*.txt".to_string()];
+    options.exclude_patterns = vec!["ignored/**".to_string()];
+
+    let harness = create_sqlite_persistent_task(
+        "pattern-filter-task",
+        &source_root,
+        vec![destination_root.clone()],
+        TaskState::Created,
+        options,
+        TaskFlowPlan::new(),
+        Arc::new(Sha256ChecksumProvider::new()),
+    )
+    .await;
+
+    harness.run().await.expect("task should run");
+
+    assert_eq!(read_text(&destination_root.join("keep.txt")), "keep");
+    assert!(
+        !destination_root.join("skip.log").exists(),
+        "non-matching include pattern should skip file"
+    );
+    assert!(
+        !destination_root.join("ignored/nested.txt").exists(),
+        "exclude pattern should skip nested file"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copied_file_metadata_matches_source_for_multiple_destinations() {
     let source_root = unique_temp_dir("persistent_task_metadata_copy_src");
     let destination_a = unique_temp_dir("persistent_task_metadata_copy_dst_a");
@@ -313,7 +349,6 @@ async fn copied_file_metadata_matches_source_for_multiple_destinations() {
         .expect("source timestamps should be settable");
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.preserve_permissions = true;
     options.preserve_timestamps = true;
 
@@ -363,6 +398,150 @@ async fn copied_file_metadata_matches_source_for_multiple_destinations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copied_file_metadata_preserves_permissions_without_forcing_timestamps() {
+    let source_root = unique_temp_dir("persistent_task_metadata_permissions_only_src");
+    let destination_a = unique_temp_dir("persistent_task_metadata_permissions_only_dst_a");
+    let destination_b = unique_temp_dir("persistent_task_metadata_permissions_only_dst_b");
+    std::fs::create_dir_all(&source_root).expect("source root should be creatable");
+
+    let source_path = source_root.join("meta.txt");
+    std::fs::write(&source_path, "metadata payload").expect("source file should be writable");
+
+    let mut source_permissions = std::fs::metadata(&source_path)
+        .expect("source metadata should be readable")
+        .permissions();
+    source_permissions.set_readonly(true);
+    std::fs::set_permissions(&source_path, source_permissions)
+        .expect("source permissions should be settable");
+
+    let fixed_time = FileTime::from_unix_time(1_500_000_000, 0);
+    set_file_times(&source_path, fixed_time, fixed_time)
+        .expect("source timestamps should be settable");
+
+    let mut options = TaskOptions::default();
+    options.preserve_permissions = true;
+    options.preserve_timestamps = false;
+
+    let harness = create_sqlite_persistent_task(
+        "metadata-permissions-only-task",
+        &source_root,
+        vec![destination_a.clone(), destination_b.clone()],
+        TaskState::Created,
+        options,
+        TaskFlowPlan::new(),
+        Arc::new(Sha256ChecksumProvider::new()),
+    )
+    .await;
+
+    harness.run().await.expect("task should run");
+
+    let source_metadata = std::fs::metadata(&source_path).expect("source metadata should exist");
+    let source_modified_secs = source_metadata
+        .modified()
+        .expect("source modified time should be readable")
+        .duration_since(UNIX_EPOCH)
+        .expect("source modified time should be after unix epoch")
+        .as_secs();
+    let source_readonly = source_metadata.permissions().readonly();
+
+    for destination in [&destination_a, &destination_b] {
+        let destination_path = destination.join("meta.txt");
+        let destination_metadata =
+            std::fs::metadata(&destination_path).expect("destination metadata should exist");
+
+        assert_eq!(
+            destination_metadata.permissions().readonly(),
+            source_readonly,
+            "destination readonly flag should match source when preserving permissions"
+        );
+
+        let destination_modified_secs = destination_metadata
+            .modified()
+            .expect("destination modified time should be readable")
+            .duration_since(UNIX_EPOCH)
+            .expect("destination modified time should be after unix epoch")
+            .as_secs();
+
+        assert_ne!(
+            destination_modified_secs, source_modified_secs,
+            "destination timestamp should not be forced to source when timestamp preservation is disabled"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn copied_file_metadata_preserves_timestamps_without_forcing_permissions() {
+    let source_root = unique_temp_dir("persistent_task_metadata_timestamps_only_src");
+    let destination_a = unique_temp_dir("persistent_task_metadata_timestamps_only_dst_a");
+    let destination_b = unique_temp_dir("persistent_task_metadata_timestamps_only_dst_b");
+    std::fs::create_dir_all(&source_root).expect("source root should be creatable");
+
+    let source_path = source_root.join("meta.txt");
+    std::fs::write(&source_path, "metadata payload").expect("source file should be writable");
+
+    let mut source_permissions = std::fs::metadata(&source_path)
+        .expect("source metadata should be readable")
+        .permissions();
+    source_permissions.set_readonly(true);
+    std::fs::set_permissions(&source_path, source_permissions)
+        .expect("source permissions should be settable");
+
+    let fixed_time = FileTime::from_unix_time(1_500_000_000, 0);
+    set_file_times(&source_path, fixed_time, fixed_time)
+        .expect("source timestamps should be settable");
+
+    let mut options = TaskOptions::default();
+    options.preserve_permissions = false;
+    options.preserve_timestamps = true;
+
+    let harness = create_sqlite_persistent_task(
+        "metadata-timestamps-only-task",
+        &source_root,
+        vec![destination_a.clone(), destination_b.clone()],
+        TaskState::Created,
+        options,
+        TaskFlowPlan::new(),
+        Arc::new(Sha256ChecksumProvider::new()),
+    )
+    .await;
+
+    harness.run().await.expect("task should run");
+
+    let source_metadata = std::fs::metadata(&source_path).expect("source metadata should exist");
+    let source_modified_secs = source_metadata
+        .modified()
+        .expect("source modified time should be readable")
+        .duration_since(UNIX_EPOCH)
+        .expect("source modified time should be after unix epoch")
+        .as_secs();
+    let source_readonly = source_metadata.permissions().readonly();
+
+    for destination in [&destination_a, &destination_b] {
+        let destination_path = destination.join("meta.txt");
+        let destination_metadata =
+            std::fs::metadata(&destination_path).expect("destination metadata should exist");
+
+        let destination_modified_secs = destination_metadata
+            .modified()
+            .expect("destination modified time should be readable")
+            .duration_since(UNIX_EPOCH)
+            .expect("destination modified time should be after unix epoch")
+            .as_secs();
+
+        assert_eq!(
+            destination_modified_secs, source_modified_secs,
+            "destination timestamp should match source when preserving timestamps"
+        );
+
+        assert_ne!(
+            destination_metadata.permissions().readonly(),
+            source_readonly,
+            "destination readonly flag should not be forced to source when permission preservation is disabled"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn copied_file_metadata_is_not_forced_when_preserve_options_are_disabled() {
     let source_root = unique_temp_dir("persistent_task_metadata_no_preserve_src");
     let destination_a = unique_temp_dir("persistent_task_metadata_no_preserve_dst_a");
@@ -384,7 +563,6 @@ async fn copied_file_metadata_is_not_forced_when_preserve_options_are_disabled()
         .expect("source timestamps should be settable");
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.preserve_permissions = false;
     options.preserve_timestamps = false;
 
@@ -440,8 +618,7 @@ async fn persistent_task_run_fan_out_copies_to_multiple_destinations() {
     let source_file = src_dir.join("nested").join("hello.txt");
     write_text(&source_file, "stream me once");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
+    let options = TaskOptions::default();
 
     let harness = create_sqlite_persistent_task(
         "fan-out-task",
@@ -490,8 +667,7 @@ async fn persistent_task_run_marks_partial_failed_when_one_destination_branch_er
     write_text(&src_dir.join("hello.txt"), "partial failure");
     write_text(&bad_root, "not a directory");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
+    let options = TaskOptions::default();
 
     let harness = create_sqlite_persistent_task(
         "partial-failed-task",
@@ -533,6 +709,7 @@ async fn persistent_task_run_marks_partial_failed_when_one_destination_branch_er
             .count(),
         1
     );
+    assert_eq!(report.retry_count, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -545,8 +722,7 @@ async fn persistent_task_marks_partial_failed_when_destination_disconnects_durin
     write_text(&src_dir.join("a-first.txt"), "first payload");
     write_text(&src_dir.join("nested/b-second.txt"), "second payload");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
+    let options = TaskOptions::default();
 
     let harness = create_sqlite_persistent_task(
         "destination-disconnect-task",
@@ -600,7 +776,6 @@ async fn persistent_task_skip_policy_is_best_effort_per_destination() {
     write_text(&dst_a.join("file.txt"), "keep me");
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.overwrite_policy = OverwritePolicy::Skip;
 
     let harness = create_sqlite_persistent_task(
@@ -653,7 +828,6 @@ async fn persistent_task_overwrite_policy_overwrites_each_destination_branch() {
     write_text(&dst_b.join("file.txt"), "old b");
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.overwrite_policy = OverwritePolicy::Overwrite;
 
     let harness = create_sqlite_persistent_task(
@@ -691,7 +865,6 @@ async fn persistent_task_newer_only_policy_decides_per_destination() {
     write_text(&dst_new.join("file.txt"), "newer target");
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.overwrite_policy = OverwritePolicy::NewerOnly;
 
     let harness = create_sqlite_persistent_task(
@@ -742,7 +915,6 @@ async fn persistent_task_rename_policy_tracks_actual_destination_path_in_report(
     write_text(&dst_dir.join("file.txt"), "existing");
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.overwrite_policy = OverwritePolicy::Rename;
 
     let harness = create_sqlite_persistent_task(
@@ -779,7 +951,6 @@ async fn persistent_task_progress_is_monotonic_and_converges_after_completion() 
     write_text(&src_dir.join("big.txt"), &"p".repeat(2 * 1024 * 1024));
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.buffer_size_bytes = 32 * 1024;
 
     let harness = create_sqlite_persistent_task(
@@ -869,7 +1040,6 @@ async fn persistent_task_progress_totals_match_multi_destination_expected_bytes(
     write_text(&src_dir.join("sized.bin"), &payload);
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::None;
     options.buffer_size_bytes = 16 * 1024;
 
     let harness = create_sqlite_persistent_task(
@@ -928,10 +1098,9 @@ async fn persistent_task_emits_detailed_progress_with_active_transfer_and_stage_
     write_text(&src_dir.join("big.txt"), &"x".repeat(2 * 1024 * 1024));
 
     let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
     options.buffer_size_bytes = 64 * 1024;
 
-    let harness = create_sqlite_persistent_task(
+    let harness = create_sqlite_persistent_task_with_verification_stages(
         "detailed-progress-task",
         &src_dir,
         vec![dst_dir.clone()],
@@ -988,5 +1157,57 @@ async fn persistent_task_emits_detailed_progress_with_active_transfer_and_stage_
     assert!(
         seen_stage_progress,
         "expected progress updates to include pipeline stage details"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistent_task_emits_preparing_state_before_running() {
+    init_test_logging();
+    let src_dir = unique_temp_dir("persistent_task_preparing_state_src");
+    let dst_dir = unique_temp_dir("persistent_task_preparing_state_dst");
+    write_text(&src_dir.join("small.txt"), "hello preparing");
+
+    let options = TaskOptions::default();
+
+    let harness = create_sqlite_persistent_task(
+        "preparing-state-task",
+        &src_dir,
+        vec![dst_dir],
+        TaskState::Created,
+        options,
+        TaskFlowPlan::new(),
+        Arc::new(Sha256ChecksumProvider::new()),
+    )
+    .await;
+    let mut updates = harness.subscribe().expect("subscribe should succeed");
+
+    harness.run().await.expect("run should succeed");
+
+    let mut seen_preparing = false;
+    let mut seen_running_after_preparing = false;
+
+    for _ in 0..128 {
+        let update = match tokio::time::timeout(Duration::from_millis(100), updates.recv()).await {
+            Ok(Ok(update)) => update,
+            Ok(Err(_)) => continue,
+            Err(_) => break,
+        };
+
+        if let TaskUpdate::State(state) = update {
+            if state == TaskState::Preparing {
+                seen_preparing = true;
+            }
+
+            if seen_preparing && state == TaskState::Running {
+                seen_running_after_preparing = true;
+                break;
+            }
+        }
+    }
+
+    assert!(seen_preparing, "expected to observe Preparing state update");
+    assert!(
+        seen_running_after_preparing,
+        "expected to observe Running state update after Preparing"
     );
 }

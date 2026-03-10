@@ -2,25 +2,26 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde_json::json;
 
 use crate::domain::{CopyError, CopyTask, FilePlan, StageProgressStatus};
 use crate::infrastructure::{ChecksumProvider, StreamingChecksum};
 use crate::pipeline::{PostWriteStage, SourceObserverStage, StageRuntimeProgress};
 
-use super::super::types::{PostWriteContext, SourceChunk, StageArtifacts, StageId};
+use super::super::types::{PostWriteContext, SourceChunk, StageArtifacts, StageId, StageSpec};
 
 const SOURCE_HASH_STAGE_ID: StageId = "builtin-source-hash";
 const DESTINATION_CHECKSUM_VERIFY_STAGE_ID: StageId = "builtin-destination-checksum-verify";
 const CHECKSUM_ARTIFACT_KEY: &str = "checksum";
 
-pub(crate) struct SourceHashStage {
+pub struct SourceHashStage {
     checksum_provider: Arc<dyn ChecksumProvider>,
     checksum: Mutex<Option<Box<dyn StreamingChecksum>>>,
     progress: Mutex<StageRuntimeProgress>,
 }
 
 impl SourceHashStage {
-    pub(crate) fn new(checksum_provider: Arc<dyn ChecksumProvider>) -> Self {
+    pub fn new(checksum_provider: Arc<dyn ChecksumProvider>) -> Self {
         Self {
             checksum_provider,
             checksum: Mutex::new(None),
@@ -39,6 +40,13 @@ impl SourceHashStage {
 impl SourceObserverStage for SourceHashStage {
     fn id(&self) -> StageId {
         SOURCE_HASH_STAGE_ID
+    }
+
+    fn spec(&self) -> Option<StageSpec> {
+        Some(
+            StageSpec::new(SOURCE_HASH_STAGE_ID)
+                .with_config(json!({ "algorithm": self.checksum_provider.algorithm() })),
+        )
     }
 
     fn reset_progress(&self, total_bytes: Option<u64>) {
@@ -115,13 +123,13 @@ impl SourceObserverStage for SourceHashStage {
     }
 }
 
-pub(crate) struct DestinationChecksumVerifyStage {
+pub struct DestinationChecksumVerifyStage {
     checksum_provider: Arc<dyn ChecksumProvider>,
     progress: Mutex<StageRuntimeProgress>,
 }
 
 impl DestinationChecksumVerifyStage {
-    pub(crate) fn new(checksum_provider: Arc<dyn ChecksumProvider>) -> Self {
+    pub fn new(checksum_provider: Arc<dyn ChecksumProvider>) -> Self {
         Self {
             checksum_provider,
             progress: Mutex::new(StageRuntimeProgress::pending(None)),
@@ -151,6 +159,13 @@ fn checksum_mismatch_error(source: &Path, destination: &Path) -> CopyError {
 impl PostWriteStage for DestinationChecksumVerifyStage {
     fn id(&self) -> StageId {
         DESTINATION_CHECKSUM_VERIFY_STAGE_ID
+    }
+
+    fn spec(&self) -> Option<StageSpec> {
+        Some(
+            StageSpec::new(DESTINATION_CHECKSUM_VERIFY_STAGE_ID)
+                .with_config(json!({ "algorithm": self.checksum_provider.algorithm() })),
+        )
     }
 
     fn reset_progress(&self, total_bytes: Option<u64>) {

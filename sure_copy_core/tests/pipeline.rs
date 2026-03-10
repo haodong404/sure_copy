@@ -2,11 +2,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde_json::json;
 use sure_copy_core::pipeline::{
     NoopPostWriteStage, NoopSourceObserverStage, PipelineArtifacts, PostWriteContext,
     PostWritePipeline, PostWritePipelineMode, PostWriteStage, SourceChunk, SourceObserverPipeline,
-    SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId, StageRuntimeProgress,
-    TaskFlowPlan,
+    SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId, StageRegistry,
+    StageRuntimeProgress, StageSpec, StageStateSpec, TaskFlowPlan, TaskFlowSpec,
 };
 use sure_copy_core::{CopyError, CopyTask, FilePlan, StageProgressStatus, TaskOptions};
 
@@ -19,6 +20,10 @@ struct CountingObserverStage {
 impl SourceObserverStage for CountingObserverStage {
     fn id(&self) -> StageId {
         "counting-observer"
+    }
+
+    fn spec(&self) -> Option<StageSpec> {
+        Some(StageSpec::new("counting-observer"))
     }
 
     async fn observe_chunk(
@@ -50,6 +55,15 @@ struct RecordingPostWriteStage {
 #[derive(Default)]
 struct ProgressAwareObserverStage {
     seen_bytes: Mutex<u64>,
+}
+
+struct MissingSpecObserverStage;
+
+#[async_trait]
+impl SourceObserverStage for MissingSpecObserverStage {
+    fn id(&self) -> StageId {
+        "missing-spec-observer"
+    }
 }
 
 #[async_trait]
@@ -89,6 +103,10 @@ impl SourceObserverStage for ProgressAwareObserverStage {
 impl PostWriteStage for RecordingPostWriteStage {
     fn id(&self) -> StageId {
         "recording-post-write"
+    }
+
+    fn spec(&self) -> Option<StageSpec> {
+        Some(StageSpec::new("recording-post-write"))
     }
 
     async fn execute(&self, ctx: &PostWriteContext) -> Result<StageArtifacts, CopyError> {
@@ -136,6 +154,116 @@ fn flow_plan_tracks_runtime_stage_attachments() {
         flow.post_write_pipeline_mode(),
         PostWritePipelineMode::SerialAfterWrite
     );
+}
+
+#[test]
+fn flow_plan_can_be_converted_into_durable_spec() {
+    let flow = TaskFlowPlan::new()
+        .with_source_observer(
+            SourceObserverPipeline::new(SourcePipelineMode::SerialBeforeFanOut)
+                .with_stage(Arc::new(CountingObserverStage::default())),
+        )
+        .with_post_write(
+            PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite)
+                .with_stage(Arc::new(RecordingPostWriteStage::default())),
+        );
+
+    let spec = flow
+        .try_to_spec()
+        .expect("flow spec conversion should succeed")
+        .expect("flow spec should exist");
+
+    assert_eq!(
+        spec.source_observer
+            .as_ref()
+            .map(|pipeline| pipeline.stages[0].kind.as_str()),
+        Some("counting-observer")
+    );
+    assert_eq!(
+        spec.post_write
+            .as_ref()
+            .map(|pipeline| pipeline.stages[0].kind.as_str()),
+        Some("recording-post-write")
+    );
+}
+
+#[test]
+fn flow_plan_to_spec_rejects_stage_without_spec() {
+    let flow = TaskFlowPlan::new().with_source_observer(
+        SourceObserverPipeline::new(SourcePipelineMode::SerialBeforeFanOut)
+            .with_stage(Arc::new(MissingSpecObserverStage)),
+    );
+
+    let err = flow
+        .try_to_spec()
+        .expect_err("stages without durable specs should be rejected");
+    assert_eq!(err.code, "STAGE_SPEC_MISSING");
+}
+
+#[test]
+fn task_flow_spec_is_empty_only_when_no_stage_specs_exist() {
+    assert!(TaskFlowSpec::default().is_empty());
+
+    let spec = TaskFlowSpec {
+        source_observer: Some(sure_copy_core::SourceObserverPipelineSpec {
+            mode: SourcePipelineMode::SerialBeforeFanOut,
+            stages: vec![StageSpec::new("observer")],
+        }),
+        post_write: None,
+    };
+
+    assert!(!spec.is_empty());
+}
+
+#[test]
+fn stage_spec_and_stage_state_spec_builders_preserve_json_payloads() {
+    let stage_spec = StageSpec::new("demo-stage").with_config(json!({"answer": 42}));
+    assert_eq!(stage_spec.kind, "demo-stage");
+    assert_eq!(
+        stage_spec.config.get("answer").and_then(|v| v.as_i64()),
+        Some(42)
+    );
+
+    let state_spec = StageStateSpec::new("demo-stage-state").with_state(json!({"offset": 7}));
+    assert_eq!(state_spec.kind, "demo-stage-state");
+    assert_eq!(
+        state_spec.state.get("offset").and_then(|v| v.as_i64()),
+        Some(7)
+    );
+}
+
+#[test]
+fn pipeline_artifacts_ignore_empty_stage_outputs() {
+    let mut artifacts = PipelineArtifacts::new();
+    artifacts.insert_stage_output("empty-stage", StageArtifacts::new());
+    assert!(artifacts.is_empty());
+}
+
+#[test]
+fn default_stage_registry_returns_none_for_unknown_specs() {
+    struct DefaultRegistry;
+    impl StageRegistry for DefaultRegistry {}
+
+    let registry = DefaultRegistry;
+    let source = registry
+        .build_source_observer_stage(&StageSpec::new("unknown-source"))
+        .expect("default source registry should succeed");
+    assert!(source.is_none());
+
+    let post_write = registry
+        .build_post_write_stage(&StageSpec::new("unknown-post-write"))
+        .expect("default post-write registry should succeed");
+    assert!(post_write.is_none());
+}
+
+#[test]
+fn source_chunk_empty_detection_matches_buffer_length() {
+    let empty = SourceChunk {
+        offset: 0,
+        bytes: Arc::<[u8]>::from(&b""[..]),
+    };
+    assert!(empty.is_empty());
+    assert_eq!(empty.len(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -21,7 +21,7 @@ pub use domain::{
     ActiveTransferProgress, CopyError, CopyErrorCategory, CopyReport, CopyTask, CopyTaskId,
     DestinationCopyStatus, DestinationPostWriteStatus, DestinationReport, FileFailure, FilePlan,
     OverwritePolicy, RetryPolicy, StageProgress, StageProgressStatus, TaskOptions, TaskProgress,
-    TaskSpec, TaskState, TaskTemplate, TransferPhase, VerificationPolicy,
+    TaskSpec, TaskState, TaskTemplate, TransferPhase,
 };
 pub use interface::SureCopyCoreApi;
 pub use orchestrator::{
@@ -29,8 +29,9 @@ pub use orchestrator::{
     TaskOrchestrator, TaskStream, TaskUpdate,
 };
 pub use pipeline::{
-    ArtifactValue, NoopPostWriteStage, NoopSourceObserverStage, PipelineArtifacts,
-    PostWriteContext, PostWritePipeline, PostWritePipelineMode, PostWriteStage, SourceChunk,
-    SourceObserverPipeline, SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId,
-    StageRuntimeProgress, TaskFlowPlan,
+    ArtifactValue, DestinationChecksumVerifyStage, NoopPostWriteStage, NoopSourceObserverStage,
+    PipelineArtifacts, PostWriteContext, PostWritePipeline, PostWritePipelineMode,
+    PostWritePipelineSpec, PostWriteStage, SourceChunk, SourceHashStage, SourceObserverPipeline,
+    SourceObserverPipelineSpec, SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId,
+    StageRegistry, StageRuntimeProgress, StageSpec, StageStateSpec, TaskFlowPlan, TaskFlowSpec,
 };

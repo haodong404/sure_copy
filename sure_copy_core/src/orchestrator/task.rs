@@ -274,3 +274,193 @@ pub trait TaskOrchestrator: Send + Sync {
         Err(CopyError::not_implemented("TaskOrchestrator::cancel_all"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+
+    struct DefaultTaskImpl {
+        task: CopyTask,
+    }
+
+    #[async_trait]
+    impl Task for DefaultTaskImpl {
+        fn snapshot(&self) -> CopyTask {
+            self.task.clone()
+        }
+
+        fn id(&self) -> &str {
+            &self.task.id
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_task_methods_cover_remaining_not_implemented_apis() {
+        let task = DefaultTaskImpl {
+            task: CopyTask::new(
+                "default-task-all-apis",
+                PathBuf::from("/src"),
+                vec![PathBuf::from("/dst")],
+                Default::default(),
+            ),
+        };
+
+        assert_eq!(
+            task.pause().await.expect_err("pause should fail").code,
+            "NOT_IMPLEMENTED"
+        );
+        assert_eq!(
+            task.resume().await.expect_err("resume should fail").code,
+            "NOT_IMPLEMENTED"
+        );
+        assert_eq!(
+            task.cancel().await.expect_err("cancel should fail").code,
+            "NOT_IMPLEMENTED"
+        );
+        assert_eq!(
+            task.progress()
+                .await
+                .expect_err("progress should fail")
+                .code,
+            "NOT_IMPLEMENTED"
+        );
+        assert_eq!(
+            task.subscribe().expect_err("subscribe should fail").code,
+            "NOT_IMPLEMENTED"
+        );
+        let report_err = match task.report().await {
+            Ok(_) => panic!("report should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(report_err.code, "NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn in_memory_task_build_report_reflects_file_plans() {
+        let runtime = TaskRuntime {
+            snapshot: CopyTask::new(
+                "report-task",
+                PathBuf::from("/src"),
+                vec![PathBuf::from("/dst")],
+                Default::default(),
+            )
+            .with_file_plans(vec![
+                crate::domain::FilePlan {
+                    source: PathBuf::from("/src/a.txt"),
+                    destinations: vec![PathBuf::from("/dst/a.txt")],
+                    expected_size_bytes: Some(1),
+                    expected_checksum: None,
+                },
+                crate::domain::FilePlan {
+                    source: PathBuf::from("/src/b.txt"),
+                    destinations: vec![PathBuf::from("/dst/b.txt")],
+                    expected_size_bytes: Some(2),
+                    expected_checksum: None,
+                },
+            ]),
+            progress: TaskProgress {
+                total_bytes: 3,
+                complete_bytes: 1,
+                ..TaskProgress::default()
+            },
+            report: None,
+        };
+
+        let report = InMemoryTask::build_report(&runtime);
+        assert_eq!(report.total_files, 2);
+        assert_eq!(report.total_bytes, 3);
+        assert_eq!(report.complete_bytes, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_memory_task_resume_from_created_is_invalid() {
+        let handle = InMemoryTask::new(
+            CopyTask::new(
+                "resume-invalid",
+                PathBuf::from("/src"),
+                vec![PathBuf::from("/dst")],
+                Default::default(),
+            ),
+            8,
+        );
+
+        let err = handle
+            .resume()
+            .await
+            .expect_err("resume from created should fail");
+        assert_eq!(err.code, "INVALID_STATE_TRANSITION");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_memory_task_run_emits_planned_and_running_events() {
+        let handle = InMemoryTask::new(
+            CopyTask::new(
+                "run-events",
+                PathBuf::from("/src"),
+                vec![PathBuf::from("/dst")],
+                Default::default(),
+            ),
+            8,
+        );
+        let mut updates = handle.subscribe().expect("subscribe should succeed");
+
+        handle.run().await.expect("run should succeed");
+
+        assert_eq!(
+            handle.state().await.expect("state should load"),
+            TaskState::Running
+        );
+        assert_eq!(
+            updates.recv().await.expect("planned event expected"),
+            TaskUpdate::State(TaskState::Planned)
+        );
+        assert_eq!(
+            updates.recv().await.expect("running event expected"),
+            TaskUpdate::State(TaskState::Running)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn in_memory_task_progress_update_invalidates_cached_report() {
+        let handle = InMemoryTask::new(
+            CopyTask::new(
+                "report-cache",
+                PathBuf::from("/src"),
+                vec![PathBuf::from("/dst")],
+                Default::default(),
+            )
+            .with_file_plans(vec![crate::domain::FilePlan {
+                source: PathBuf::from("/src/file.txt"),
+                destinations: vec![PathBuf::from("/dst/file.txt")],
+                expected_size_bytes: Some(10),
+                expected_checksum: None,
+            }]),
+            8,
+        );
+
+        let first = handle
+            .report()
+            .await
+            .expect("initial report should succeed");
+        assert_eq!(first.complete_bytes, 0);
+        assert_eq!(first.total_files, 1);
+
+        handle
+            .set_progress(TaskProgress {
+                total_bytes: 10,
+                complete_bytes: 7,
+                ..TaskProgress::default()
+            })
+            .expect("set progress should succeed");
+
+        let second = handle
+            .report()
+            .await
+            .expect("updated report should succeed");
+        assert_eq!(second.total_bytes, 10);
+        assert_eq!(second.complete_bytes, 7);
+        assert_eq!(second.total_files, 1);
+    }
+}

@@ -1,3 +1,3 @@
 mod verification;
 
-pub(crate) use verification::{DestinationChecksumVerifyStage, SourceHashStage};
+pub use verification::{DestinationChecksumVerifyStage, SourceHashStage};

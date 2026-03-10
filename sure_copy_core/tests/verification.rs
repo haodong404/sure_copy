@@ -10,13 +10,10 @@ use async_trait::async_trait;
 use sqlx::Row;
 use sure_copy_core::infrastructure::{ChecksumProvider, Sha256ChecksumProvider, StreamingChecksum};
 use sure_copy_core::pipeline::{SourcePipelineMode, StageArtifacts, TaskFlowPlan};
-use sure_copy_core::testing::create_sqlite_persistent_task;
-use sure_copy_core::{
-    CopyError, CopyTask, DestinationPostWriteStatus, OrchestratorConfig, PostWritePipelineMode,
-    SqliteTaskOrchestrator, TaskOptions, TaskOrchestrator, TaskState, VerificationPolicy,
-};
+use sure_copy_core::testing::create_sqlite_persistent_task_with_verification_stages;
+use sure_copy_core::{CopyError, DestinationPostWriteStatus, TaskOptions, TaskState};
 
-use common::{init_test_logging, unique_temp_dir, unique_temp_file};
+use common::{init_test_logging, unique_temp_dir};
 
 fn write_text(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
@@ -90,12 +87,6 @@ impl ChecksumProvider for SelectiveMismatchChecksumProvider {
     }
 }
 
-async fn new_orchestrator(db_path: &Path) -> SqliteTaskOrchestrator {
-    SqliteTaskOrchestrator::new(db_path, OrchestratorConfig::default())
-        .await
-        .expect("SQLite orchestrator should initialize")
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn serial_before_fan_out_runs_verification_through_pipeline_stages() {
     let source_root = unique_temp_dir("verification_serial_src");
@@ -104,11 +95,10 @@ async fn serial_before_fan_out_runs_verification_through_pipeline_stages() {
     std::fs::write(source_root.join("file.txt"), "serial mode")
         .expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
 
     let checksum_provider = Arc::new(CountingChecksumProvider::new());
-    let harness = create_sqlite_persistent_task(
+    let harness = create_sqlite_persistent_task_with_verification_stages(
         "verification-serial-task",
         &source_root,
         vec![destination_root.clone()],
@@ -143,11 +133,10 @@ async fn concurrent_with_fan_out_runs_verification_through_pipeline_stages() {
     std::fs::write(source_root.join("file.txt"), "concurrent mode")
         .expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
 
     let checksum_provider = Arc::new(CountingChecksumProvider::new());
-    let harness = create_sqlite_persistent_task(
+    let harness = create_sqlite_persistent_task_with_verification_stages(
         "verification-concurrent-task",
         &source_root,
         vec![destination_root.clone()],
@@ -176,11 +165,10 @@ async fn resume_replays_source_observer_when_no_persisted_artifacts_exist() {
     std::fs::write(source_root.join("file.txt"), "resume source")
         .expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
 
     let checksum_provider = Arc::new(CountingChecksumProvider::new());
-    let harness = create_sqlite_persistent_task(
+    let harness = create_sqlite_persistent_task_with_verification_stages(
         "verification-resume-replay-task",
         &source_root,
         vec![destination_root.clone()],
@@ -227,11 +215,10 @@ async fn resume_reuses_persisted_source_artifacts_when_fingerprint_matches() {
     let source_path = source_root.join("file.txt");
     std::fs::write(&source_path, "resume source").expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
 
     let checksum_provider = Arc::new(CountingChecksumProvider::new());
-    let harness = create_sqlite_persistent_task(
+    let harness = create_sqlite_persistent_task_with_verification_stages(
         "verification-resume-reuse-task",
         &source_root,
         vec![destination_root.clone()],
@@ -308,13 +295,12 @@ async fn post_write_verification_failure_only_fails_the_affected_destination_bra
     std::fs::write(source_root.join("file.txt"), "branch checksum")
         .expect("source file should be writable");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
 
     let bad_path = destination_bad.join("file.txt");
     let checksum_provider: Arc<dyn ChecksumProvider> =
         Arc::new(SelectiveMismatchChecksumProvider::new([bad_path]));
-    let harness = create_sqlite_persistent_task(
+    let harness = create_sqlite_persistent_task_with_verification_stages(
         "verification-branch-task",
         &source_root,
         vec![destination_good.clone(), destination_bad.clone()],
@@ -354,38 +340,30 @@ async fn post_write_verification_failure_only_fails_the_affected_destination_bra
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_source_hash_and_post_write_verification_completes_in_serial_mode() {
     init_test_logging();
-    let db_path = unique_temp_file("sqlite_source_hash_and_post_write.db");
     let src_dir = unique_temp_dir("sqlite_source_hash_and_post_write_src");
     let dst_dir = unique_temp_dir("sqlite_source_hash_and_post_write_dst");
     write_text(&src_dir.join("verify.txt"), "verify me");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
+    let checksum_provider = Arc::new(Sha256ChecksumProvider::new());
+    let harness = create_sqlite_persistent_task_with_verification_stages(
+        "verify-task",
+        &src_dir,
+        vec![dst_dir.clone()],
+        TaskState::Created,
+        options,
+        TaskFlowPlan::new().with_source_pipeline_mode(SourcePipelineMode::SerialBeforeFanOut),
+        checksum_provider,
+    )
+    .await;
 
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(
-            CopyTask::new(
-                "verify-task",
-                src_dir.clone(),
-                vec![dst_dir.clone()],
-                options,
-            )
-            .with_flow(
-                TaskFlowPlan::new()
-                    .with_source_pipeline_mode(SourcePipelineMode::SerialBeforeFanOut)
-                    .with_post_write_pipeline_mode(PostWritePipelineMode::SerialAfterWrite),
-            ),
-        )
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
+    harness.run().await.expect("task should run");
 
     assert_eq!(
-        handle.state().await.expect("state should load"),
+        harness.state().await.expect("state should load"),
         TaskState::Completed
     );
-    let report = handle.report().await.expect("report should be available");
+    let report = harness.report().await.expect("report should be available");
     assert_eq!(report.destinations.len(), 1);
     assert_eq!(
         report.destinations[0].post_write_status,
@@ -396,36 +374,32 @@ async fn sqlite_source_hash_and_post_write_verification_completes_in_serial_mode
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_persists_source_artifacts_for_builtin_source_hash_stage() {
     init_test_logging();
-    let db_path = unique_temp_file("sqlite_source_artifacts.db");
     let src_dir = unique_temp_dir("sqlite_source_artifacts_src");
     let dst_dir = unique_temp_dir("sqlite_source_artifacts_dst");
     let source_path = src_dir.join("verify.txt");
     write_text(&source_path, "persist my checksum");
 
-    let mut options = TaskOptions::default();
-    options.verification_policy = VerificationPolicy::SourceHashAndPostWrite;
+    let options = TaskOptions::default();
+    let checksum_provider = Arc::new(Sha256ChecksumProvider::new());
+    let harness = create_sqlite_persistent_task_with_verification_stages(
+        "source-artifacts-task",
+        &src_dir,
+        vec![dst_dir.clone()],
+        TaskState::Created,
+        options,
+        TaskFlowPlan::new().with_source_pipeline_mode(SourcePipelineMode::SerialBeforeFanOut),
+        checksum_provider,
+    )
+    .await;
 
-    let orchestrator = new_orchestrator(&db_path).await;
-    let handle = orchestrator
-        .submit(CopyTask::new(
-            "source-artifacts-task",
-            src_dir.clone(),
-            vec![dst_dir.clone()],
-            options,
-        ))
-        .await
-        .expect("task submit should succeed");
-    handle.run().await.expect("task should run");
+    harness.run().await.expect("task should run");
 
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
-        .await
-        .expect("test should connect to sqlite database");
     let row = sqlx::query(
         "SELECT stage_key, artifacts_json FROM task_source_artifacts WHERE task_id = ? AND source_path = ?",
     )
     .bind("source-artifacts-task")
     .bind(source_path.to_string_lossy().to_string())
-    .fetch_one(&pool)
+    .fetch_one(harness.pool())
     .await
     .expect("source artifacts should persist");
 

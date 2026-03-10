@@ -14,8 +14,12 @@ use crate::orchestrator::orchestrator_sqlite::{
 use crate::orchestrator::persistent_task::PersistentTask;
 use crate::orchestrator::sqlite_artifact_store::{
     SqliteArtifactStore, TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL, TASK_SOURCE_ARTIFACTS_SCHEMA_SQL,
+    TASK_STAGE_STATES_SCHEMA_SQL,
 };
-use crate::pipeline::TaskFlowPlan;
+use crate::pipeline::{
+    DestinationChecksumVerifyStage, PostWritePipeline, PostWritePipelineMode, SourceHashStage,
+    SourceObserverPipeline, SourcePipelineMode, TaskFlowPlan,
+};
 use crate::{Task, TaskStream};
 
 pub struct PersistentTaskHarness {
@@ -58,6 +62,27 @@ pub async fn create_sqlite_persistent_task(
     flow: TaskFlowPlan,
     checksum_provider: Arc<dyn ChecksumProvider>,
 ) -> PersistentTaskHarness {
+    create_sqlite_persistent_task_with_flow(
+        task_id,
+        source_root,
+        destination_roots,
+        state,
+        options,
+        flow,
+        checksum_provider,
+    )
+    .await
+}
+
+async fn create_sqlite_persistent_task_with_flow(
+    task_id: &str,
+    source_root: &Path,
+    destination_roots: Vec<PathBuf>,
+    state: TaskState,
+    options: TaskOptions,
+    flow: TaskFlowPlan,
+    _checksum_provider: Arc<dyn ChecksumProvider>,
+) -> PersistentTaskHarness {
     let pool = SqlitePool::connect("sqlite::memory:")
         .await
         .expect("sqlite in-memory database should connect");
@@ -82,8 +107,13 @@ pub async fn create_sqlite_persistent_task(
         .await
         .expect("destination artifacts table should be created");
 
+    sqlx::query(TASK_STAGE_STATES_SCHEMA_SQL)
+        .execute(&pool)
+        .await
+        .expect("stage states table should be created");
+
     sqlx::query(
-        "INSERT INTO tasks (id, source_root, destinations_json, spec_json, state, total_bytes, complete_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO tasks (id, source_root, destinations_json, spec_json, file_plans_json, state, total_bytes, complete_bytes, retry_count, started_at_ms, finished_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(task_id)
     .bind(source_root.to_string_lossy().to_string())
@@ -97,9 +127,11 @@ pub async fn create_sqlite_persistent_task(
         .expect("destinations json should encode"),
     )
     .bind("{}")
+    .bind("[]")
     .bind(match state {
         TaskState::Created => "created",
         TaskState::Planned => "planned",
+        TaskState::Preparing => "preparing",
         TaskState::Running => "running",
         TaskState::Completed => "completed",
         TaskState::PartialFailed => "partial_failed",
@@ -109,6 +141,9 @@ pub async fn create_sqlite_persistent_task(
     })
     .bind(0_i64)
     .bind(0_i64)
+    .bind(0_i64)
+    .bind(Option::<i64>::None)
+    .bind(Option::<i64>::None)
     .execute(&pool)
     .await
     .expect("task row should be inserted");
@@ -131,9 +166,61 @@ pub async fn create_sqlite_persistent_task(
             8,
             pool.clone(),
             Arc::new(LocalFileSystem::new()),
-            checksum_provider,
+            _checksum_provider,
             artifact_store,
+            None,
         ),
         pool,
     }
+}
+
+pub fn checksum_verification_flow(
+    checksum_provider: Arc<dyn ChecksumProvider>,
+    source_mode: SourcePipelineMode,
+) -> TaskFlowPlan {
+    TaskFlowPlan::new()
+        .with_source_observer(
+            SourceObserverPipeline::new(source_mode).with_stage(Arc::new(SourceHashStage::new(
+                Arc::clone(&checksum_provider),
+            ))),
+        )
+        .with_post_write(
+            PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite).with_stage(Arc::new(
+                DestinationChecksumVerifyStage::new(checksum_provider),
+            )),
+        )
+}
+
+pub async fn create_sqlite_persistent_task_with_verification_stages(
+    task_id: &str,
+    source_root: &Path,
+    destination_roots: Vec<PathBuf>,
+    state: TaskState,
+    options: TaskOptions,
+    flow: TaskFlowPlan,
+    checksum_provider: Arc<dyn ChecksumProvider>,
+) -> PersistentTaskHarness {
+    let source_mode = flow.source_pipeline_mode();
+    let flow = flow
+        .with_source_observer(
+            SourceObserverPipeline::new(source_mode).with_stage(Arc::new(SourceHashStage::new(
+                Arc::clone(&checksum_provider),
+            ))),
+        )
+        .with_post_write(
+            PostWritePipeline::new(PostWritePipelineMode::SerialAfterWrite).with_stage(Arc::new(
+                DestinationChecksumVerifyStage::new(Arc::clone(&checksum_provider)),
+            )),
+        );
+
+    create_sqlite_persistent_task_with_flow(
+        task_id,
+        source_root,
+        destination_roots,
+        state,
+        options,
+        flow,
+        checksum_provider,
+    )
+    .await
 }

@@ -5,7 +5,7 @@
 ## What This Crate Provides
 
 - `CopyTask` and `TaskSpec` for describing copy work.
-- `TaskOptions` for overwrite, verification, retry, and concurrency policies.
+- `TaskOptions` for overwrite, retry, concurrency, and file-selection policies.
 - `TaskOrchestrator` implementations for ephemeral and durable runtimes.
 - `Task` handles for running, pausing, resuming, cancelling, and observing tasks.
 - `TaskUpdate` streams for UI progress.
@@ -157,6 +157,31 @@ async fn main() -> Result<(), sure_copy_core::CopyError> {
 
 The split matters for durable orchestration. SQLite-backed tasks persist the submission spec and rebuild the runtime snapshot from storage on restart.
 
+### Planning model at a glance
+
+Several similarly named types exist because they describe different layers of the system:
+
+- `TaskSpec`: the immutable submission payload.
+    - Describes the requested work at configuration level.
+    - Durable and data-only.
+- `CopyTask`: the runtime snapshot.
+    - Wraps the spec data and adds state, runtime flow attachments, and file plans.
+- `FilePlan`: one concrete file-copy work item.
+    - Answers: "for this source file, which destination file paths should be produced?"
+    - This is file-level work decomposition, not pipeline orchestration.
+- `TaskFlowPlan`: the runtime execution-flow plan.
+    - Answers: "how should file copy work flow through source observers and post-write stages?"
+    - May contain runtime stage objects and therefore is not directly durable.
+- `TaskFlowSpec`: the durable, data-only version of flow configuration.
+    - Used to persist pipeline/stage definitions and rebuild them later through `StageRegistry`.
+
+The shortest way to think about the split is:
+
+- `FilePlan` = **what to copy**
+- `TaskFlowPlan` = **how to process it while copying**
+
+This separation keeps file mapping, durable persistence, and runtime pipeline composition from collapsing into one overloaded type.
+
 ### Task lifecycle
 
 The runtime uses this state machine:
@@ -174,10 +199,13 @@ Exceptional branches:
 - `Paused -> Running`
 - `Paused -> Cancelled`
 
-### Verification and retries
+### Pipelines and retries
 
 - `OverwritePolicy` controls what happens when the destination already exists.
-- `VerificationPolicy` controls whether copy results are checksum-verified.
+- `TaskFlowPlan` lets callers compose source observers and post-write stages explicitly.
+- `TaskFlowSpec` durably persists pipeline/stage definitions so tasks can survive restarts.
+- `StageRegistry` rebuilds runtime stage objects from persisted stage configs.
+- `StageStateSpec` lets resumable stages persist their own internal state snapshots between runs.
 - `RetryPolicy` controls retry count and exponential backoff during copy failures.
 
 ## Design Structure
@@ -229,7 +257,10 @@ The durable runtime support is intentionally conservative:
 
 - `SourcePipelineMode` controls whether source observers run before fan-out or during fan-out.
 - `PostWritePipelineMode::SerialAfterWrite` runs after each destination write completes.
-- Durable SQLite tasks reject custom runtime stages because trait-object stages are not yet persisted safely.
+- Runtime stages are attached explicitly through `TaskFlowPlan`.
+- Durable SQLite tasks persist `TaskFlowSpec` and rebuild runtime stage objects through `StageRegistry`.
+- Every stage that should survive restart must expose a durable `StageSpec`; otherwise SQLite submission rejects it.
+- Stages that want to resume from a prior partial run can also expose `StageStateSpec` snapshots and restore themselves on restart.
 
 ### `infrastructure`
 
@@ -250,7 +281,8 @@ The crate is usable today, but it is important to understand the current boundar
 - Resume works at file/destination checkpoint granularity, not byte-range partial copy granularity.
 - Rename overwrite mode records the actual destination path in checkpoints.
 - Progress is computed from checkpoint `expected_bytes`, so totals stay stable during resume.
-- Custom runtime stage execution is not yet supported by the durable SQLite orchestrator.
+- Durable runtime stage recovery depends on application-provided `StageRegistry` implementations for non-built-in stages.
+- Stage state snapshots are restored before a stage reprocesses replayed source chunks or post-write work, but true byte-range destination resume is still out of scope.
 - The in-memory orchestrator is intentionally simpler and does not aim to mirror every durability concern.
 
 ## Suggested Integration Pattern

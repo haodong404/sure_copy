@@ -1,16 +1,19 @@
 mod common;
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use serde_json::json;
 use sqlx::Row;
 use sure_copy_core::pipeline::{
-    SourceObserverPipeline, SourceObserverStage, SourcePipelineMode, StageId, TaskFlowPlan,
+    SourceObserverPipeline, SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId,
+    StageRegistry, StageSpec, StageStateSpec, TaskFlowPlan,
 };
 use sure_copy_core::{
     CopyError, CopyTask, OrchestratorConfig, PostWritePipelineMode, SqliteTaskOrchestrator,
-    TaskOptions, TaskOrchestrator, TaskState, VerificationPolicy,
+    TaskOptions, TaskOrchestrator, TaskState,
 };
 
 use common::{init_test_logging, unique_temp_dir, unique_temp_file};
@@ -44,6 +47,146 @@ impl SourceObserverStage for DummyObserverStage {
         _chunk: &sure_copy_core::SourceChunk,
     ) -> Result<(), CopyError> {
         Ok(())
+    }
+}
+
+struct CountingObserverStage {
+    count: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SourceObserverStage for CountingObserverStage {
+    fn id(&self) -> StageId {
+        "counting-observer"
+    }
+
+    fn spec(&self) -> Option<StageSpec> {
+        Some(StageSpec::new("counting-observer"))
+    }
+
+    async fn observe_chunk(
+        &self,
+        _task: &CopyTask,
+        _plan: &sure_copy_core::FilePlan,
+        _chunk: &sure_copy_core::SourceChunk,
+    ) -> Result<(), CopyError> {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+struct TestStageRegistry {
+    build_calls: Arc<AtomicUsize>,
+    observed_chunks: Arc<AtomicUsize>,
+}
+
+impl TestStageRegistry {
+    fn new() -> Self {
+        Self {
+            build_calls: Arc::new(AtomicUsize::new(0)),
+            observed_chunks: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+struct ResumableObserverStage {
+    seen_bytes: Mutex<u64>,
+    restored: AtomicUsize,
+}
+
+impl ResumableObserverStage {
+    fn new() -> Self {
+        Self {
+            seen_bytes: Mutex::new(0),
+            restored: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SourceObserverStage for ResumableObserverStage {
+    fn id(&self) -> StageId {
+        "resumable-observer"
+    }
+
+    fn spec(&self) -> Option<StageSpec> {
+        Some(StageSpec::new("resumable-observer"))
+    }
+
+    fn snapshot_state(&self) -> Option<StageStateSpec> {
+        let seen_bytes = *self
+            .seen_bytes
+            .lock()
+            .expect("resumable stage lock should not be poisoned");
+        Some(StageStateSpec::new("resumable-observer").with_state(json!({
+            "seen_bytes": seen_bytes,
+        })))
+    }
+
+    fn restore_state(&self, state: &StageStateSpec) -> Result<(), CopyError> {
+        let seen_bytes = state
+            .state
+            .get("seen_bytes")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        *self
+            .seen_bytes
+            .lock()
+            .expect("resumable stage lock should not be poisoned") = seen_bytes;
+        self.restored.store(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    async fn observe_chunk(
+        &self,
+        _task: &CopyTask,
+        _plan: &sure_copy_core::FilePlan,
+        chunk: &sure_copy_core::SourceChunk,
+    ) -> Result<(), CopyError> {
+        let mut seen = self
+            .seen_bytes
+            .lock()
+            .expect("resumable stage lock should not be poisoned");
+        let chunk_end = chunk.offset.saturating_add(chunk.len() as u64);
+        if chunk_end <= *seen {
+            return Ok(());
+        }
+        let unprocessed_start = (*seen).max(chunk.offset);
+        *seen = (*seen).saturating_add(chunk_end.saturating_sub(unprocessed_start));
+        Ok(())
+    }
+
+    async fn finish(
+        &self,
+        _task: &CopyTask,
+        _plan: &sure_copy_core::FilePlan,
+    ) -> Result<StageArtifacts, CopyError> {
+        let seen = *self
+            .seen_bytes
+            .lock()
+            .expect("resumable stage lock should not be poisoned");
+        Ok(StageArtifacts::new()
+            .with_value("seen_bytes", seen as i64)
+            .with_value("restored", self.restored.load(Ordering::Relaxed) > 0))
+    }
+}
+
+impl StageRegistry for TestStageRegistry {
+    fn build_source_observer_stage(
+        &self,
+        spec: &StageSpec,
+    ) -> Result<Option<Arc<dyn SourceObserverStage>>, CopyError> {
+        self.build_calls.fetch_add(1, Ordering::Relaxed);
+        if spec.kind != "counting-observer" {
+            if spec.kind == "resumable-observer" {
+                return Ok(Some(Arc::new(ResumableObserverStage::new())));
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(Arc::new(CountingObserverStage {
+            count: Arc::clone(&self.observed_chunks),
+        })))
     }
 }
 
@@ -93,9 +236,9 @@ async fn sqlite_persists_flow_modes_across_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sqlite_rejects_runtime_stage_attachments() {
+async fn sqlite_rejects_runtime_stages_without_persistable_specs() {
     init_test_logging();
-    let db_path = unique_temp_file("sqlite_runtime_stage_reject.db");
+    let db_path = unique_temp_file("sqlite_runtime_stage_accept.db");
     let src_dir = unique_temp_dir("sqlite_runtime_stage_src");
     let dst_dir = unique_temp_dir("sqlite_runtime_stage_dst");
     std::fs::create_dir_all(&src_dir).expect("source dir should be creatable");
@@ -116,10 +259,260 @@ async fn sqlite_rejects_runtime_stage_attachments() {
     );
 
     let err = match orchestrator.submit(task).await {
-        Ok(_) => panic!("durable runtime stages must be rejected"),
+        Ok(_) => panic!("runtime stage attachments without specs should be rejected"),
         Err(err) => err,
     };
-    assert_eq!(err.code, "UNSUPPORTED_FEATURE");
+    assert_eq!(err.code, "STAGE_SPEC_MISSING");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_rehydrates_bound_runtime_flows_after_restart() {
+    init_test_logging();
+    let db_path = unique_temp_file("sqlite_runtime_stage_rehydrate.db");
+    let src_dir = unique_temp_dir("sqlite_runtime_stage_rehydrate_src");
+    let dst_dir = unique_temp_dir("sqlite_runtime_stage_rehydrate_dst");
+    write_text(&src_dir.join("file.txt"), "rehydrate me");
+
+    {
+        let orchestrator = new_orchestrator(&db_path).await;
+        let task = CopyTask::new(
+            "runtime-stage-rehydrate-task",
+            src_dir.clone(),
+            vec![dst_dir.clone()],
+            TaskOptions::default(),
+        )
+        .with_flow(TaskFlowPlan::new().with_source_observer(
+            SourceObserverPipeline::new(SourcePipelineMode::SerialBeforeFanOut).with_stage(
+                Arc::new(CountingObserverStage {
+                    count: Arc::new(AtomicUsize::new(0)),
+                }),
+            ),
+        ));
+
+        orchestrator
+            .submit(task)
+            .await
+            .expect("task submit should succeed");
+    }
+
+    let registry = Arc::new(TestStageRegistry::new());
+    let orchestrator = SqliteTaskOrchestrator::new_with_stage_registry(
+        &db_path,
+        OrchestratorConfig::default(),
+        Some(registry.clone()),
+    )
+    .await
+    .expect("SQLite orchestrator with stage registry should initialize");
+
+    let handle = orchestrator
+        .get_task("runtime-stage-rehydrate-task")
+        .await
+        .expect("task lookup should work");
+    handle.run().await.expect("reloaded task should run");
+
+    assert!(registry.build_calls.load(Ordering::Relaxed) >= 1);
+    assert!(registry.observed_chunks.load(Ordering::Relaxed) >= 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_restores_persisted_stage_state_after_restart() {
+    init_test_logging();
+    let db_path = unique_temp_file("sqlite_stage_state_restore.db");
+    let src_dir = unique_temp_dir("sqlite_stage_state_restore_src");
+    let dst_dir = unique_temp_dir("sqlite_stage_state_restore_dst");
+    let source_path = src_dir.join("file.txt");
+    write_text(&source_path, "123456789");
+
+    {
+        let orchestrator = new_orchestrator(&db_path).await;
+        let task = CopyTask::new(
+            "stage-state-restore-task",
+            src_dir.clone(),
+            vec![dst_dir.clone()],
+            TaskOptions::default(),
+        )
+        .with_flow(
+            TaskFlowPlan::new().with_source_observer(
+                SourceObserverPipeline::new(SourcePipelineMode::SerialBeforeFanOut)
+                    .with_stage(Arc::new(ResumableObserverStage::new())),
+            ),
+        );
+
+        orchestrator
+            .submit(task)
+            .await
+            .expect("task submit should succeed");
+    }
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("test should connect to sqlite database");
+    sqlx::query(
+        "INSERT OR REPLACE INTO task_stage_states (task_id, source_path, destination_path, stage_key, state_json, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("stage-state-restore-task")
+    .bind(source_path.to_string_lossy().to_string())
+    .bind("")
+    .bind("resumable-observer")
+    .bind(
+        serde_json::to_string(&StageStateSpec::new("resumable-observer").with_state(json!({
+            "seen_bytes": 5_u64,
+        })))
+        .expect("stage state json should encode"),
+    )
+    .bind(0_i64)
+    .execute(&pool)
+    .await
+    .expect("stage state row should be insertable");
+    drop(pool);
+
+    let registry = Arc::new(TestStageRegistry::new());
+    let orchestrator = SqliteTaskOrchestrator::new_with_stage_registry(
+        &db_path,
+        OrchestratorConfig::default(),
+        Some(registry),
+    )
+    .await
+    .expect("SQLite orchestrator with stage registry should initialize");
+
+    let handle = orchestrator
+        .get_task("stage-state-restore-task")
+        .await
+        .expect("task lookup should work");
+    handle.run().await.expect("reloaded task should run");
+
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", db_path.display()))
+        .await
+        .expect("test should reconnect to sqlite database");
+    let row = sqlx::query(
+        "SELECT artifacts_json FROM task_source_artifacts WHERE task_id = ? AND source_path = ? AND stage_key = ?",
+    )
+    .bind("stage-state-restore-task")
+    .bind(source_path.to_string_lossy().to_string())
+    .bind("resumable-observer")
+    .fetch_one(&pool)
+    .await
+    .expect("source artifacts row should exist");
+
+    let artifacts_json = row
+        .try_get::<String, _>("artifacts_json")
+        .expect("artifacts json should load");
+    let artifacts: StageArtifacts =
+        serde_json::from_str(&artifacts_json).expect("artifacts should decode");
+    assert_eq!(
+        artifacts.get("restored").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        artifacts.get("seen_bytes").and_then(|v| v.as_i64()),
+        Some(9)
+    );
+
+    let remaining_states = sqlx::query(
+        "SELECT COUNT(*) as count FROM task_stage_states WHERE task_id = ? AND source_path = ? AND stage_key = ?",
+    )
+    .bind("stage-state-restore-task")
+    .bind(source_path.to_string_lossy().to_string())
+    .bind("resumable-observer")
+    .fetch_one(&pool)
+    .await
+    .expect("stage state rows should load")
+    .try_get::<i64, _>("count")
+    .expect("count should load");
+    assert_eq!(remaining_states, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_rejects_overlapping_source_and_destination() {
+    init_test_logging();
+    let db_path = unique_temp_file("sqlite_overlap_validation.db");
+    let src_dir = unique_temp_dir("sqlite_overlap_validation_src");
+    std::fs::create_dir_all(src_dir.join("dest")).expect("nested destination should be creatable");
+
+    let orchestrator = new_orchestrator(&db_path).await;
+    let err = match orchestrator
+        .submit(CopyTask::new(
+            "overlap-task",
+            src_dir.clone(),
+            vec![src_dir.join("dest")],
+            TaskOptions::default(),
+        ))
+        .await
+    {
+        Ok(_) => panic!("overlapping source and destination should fail validation"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, "OVERLAPPING_SOURCE_DESTINATION");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_rejects_invalid_glob_patterns() {
+    init_test_logging();
+    let db_path = unique_temp_file("sqlite_glob_validation.db");
+    let src_dir = unique_temp_dir("sqlite_glob_validation_src");
+    let dst_dir = unique_temp_dir("sqlite_glob_validation_dst");
+    std::fs::create_dir_all(&src_dir).expect("source dir should be creatable");
+    std::fs::create_dir_all(&dst_dir).expect("destination dir should be creatable");
+
+    let orchestrator = new_orchestrator(&db_path).await;
+    let mut options = TaskOptions::default();
+    options.include_patterns = vec!["[broken".to_string()];
+
+    let err = match orchestrator
+        .submit(CopyTask::new(
+            "glob-validation-task",
+            src_dir,
+            vec![dst_dir],
+            options,
+        ))
+        .await
+    {
+        Ok(_) => panic!("invalid glob pattern should fail validation"),
+        Err(err) => err,
+    };
+
+    assert_eq!(err.code, "INVALID_GLOB_PATTERN");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_persists_file_manifest_across_restart() {
+    init_test_logging();
+    let db_path = unique_temp_file("sqlite_file_manifest_reload.db");
+    let src_dir = unique_temp_dir("sqlite_file_manifest_reload_src");
+    let dst_dir = unique_temp_dir("sqlite_file_manifest_reload_dst");
+    write_text(&src_dir.join("kept.txt"), "keep me");
+
+    {
+        let orchestrator = new_orchestrator(&db_path).await;
+        let handle = orchestrator
+            .submit(CopyTask::new(
+                "manifest-reload-task",
+                src_dir.clone(),
+                vec![dst_dir.clone()],
+                TaskOptions::default(),
+            ))
+            .await
+            .expect("task submit should succeed");
+        handle.run().await.expect("task should run once");
+    }
+
+    write_text(&src_dir.join("new-after-run.txt"), "should not backfill");
+
+    let orchestrator = new_orchestrator(&db_path).await;
+    let reloaded = orchestrator
+        .get_task("manifest-reload-task")
+        .await
+        .expect("task should reload after restart");
+
+    assert_eq!(reloaded.snapshot().file_plans.len(), 1);
+    assert_eq!(
+        reloaded.snapshot().file_plans[0]
+            .source
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("kept.txt")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -228,8 +621,7 @@ async fn sqlite_partial_failed_state_persists_across_restart() {
 
     {
         let orchestrator = new_orchestrator(&db_path).await;
-        let mut options = TaskOptions::default();
-        options.verification_policy = VerificationPolicy::None;
+        let options = TaskOptions::default();
 
         let handle = orchestrator
             .submit(CopyTask::new(

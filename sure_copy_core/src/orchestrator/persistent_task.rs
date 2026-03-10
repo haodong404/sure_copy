@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use filetime::FileTime;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use log::{debug, error, info, warn};
 use sqlx::{Row, SqlitePool};
 use tokio::fs::{self, OpenOptions};
@@ -20,8 +21,9 @@ use crate::domain::{
 use crate::infrastructure::{ChecksumProvider, FileSystem};
 use crate::pipeline::{
     DestinationChecksumVerifyStage, PipelineArtifacts, PostWriteContext, PostWritePipeline,
-    PostWritePipelineMode, SourceChunk, SourceHashStage, SourceObserverPipeline,
-    SourceObserverStage, SourcePipelineMode, StageArtifacts, StageId,
+    PostWritePipelineMode, PostWritePipelineSpec, SourceChunk, SourceHashStage,
+    SourceObserverPipeline, SourceObserverPipelineSpec, SourceObserverStage, SourcePipelineMode,
+    StageArtifacts, StageId, StageRegistry, StageSpec, StageStateSpec, TaskFlowPlan, TaskFlowSpec,
 };
 
 use super::artifact_store::{ArtifactStore, SourceFingerprint};
@@ -181,8 +183,67 @@ fn io_error(code: &'static str, message: String) -> CopyError {
     }
 }
 
+fn encode_stage_state(state: &StageStateSpec) -> Result<String, CopyError> {
+    serde_json::to_string(state).map_err(|err| CopyError {
+        category: CopyErrorCategory::Io,
+        code: "SERDE_ERROR",
+        message: format!("failed to encode stage state: {}", err),
+    })
+}
+
+fn decode_stage_state(state_json: &str) -> Result<StageStateSpec, CopyError> {
+    serde_json::from_str(state_json).map_err(|err| CopyError {
+        category: CopyErrorCategory::Io,
+        code: "SERDE_ERROR",
+        message: format!("failed to decode stage state: {}", err),
+    })
+}
+
 fn source_observer_branch_name(source: &Path) -> String {
     format!("source-observer:{}", source.display())
+}
+
+fn normalize_relative_glob_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn compile_glob_set(
+    patterns: &[String],
+    context: &'static str,
+) -> Result<Option<GlobSet>, CopyError> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = Glob::new(pattern).map_err(|err| CopyError {
+            category: CopyErrorCategory::Path,
+            code: "INVALID_GLOB_PATTERN",
+            message: format!("invalid glob pattern '{}' in {}: {}", pattern, context, err),
+        })?;
+        builder.add(glob);
+    }
+
+    builder.build().map(Some).map_err(|err| CopyError {
+        category: CopyErrorCategory::Path,
+        code: "INVALID_GLOB_PATTERN",
+        message: format!("failed to build glob matcher in {}: {}", context, err),
+    })
+}
+
+fn source_matches_patterns(
+    relative_path: &Path,
+    include_set: Option<&GlobSet>,
+    exclude_set: Option<&GlobSet>,
+) -> bool {
+    let normalized = normalize_relative_glob_path(relative_path);
+    let included = include_set.is_none_or(|set| set.is_match(&normalized));
+    let excluded = exclude_set.is_some_and(|set| set.is_match(&normalized));
+    included && !excluded
 }
 
 /// SQLite-backed concrete task handle with file/destination checkpoint execution.
@@ -194,10 +255,17 @@ pub struct PersistentTask {
     file_system: Arc<dyn FileSystem>,
     checksum_provider: Arc<dyn ChecksumProvider>,
     artifact_store: Arc<dyn ArtifactStore>,
+    stage_registry: Option<Arc<dyn StageRegistry>>,
     execution_lock: AsyncMutex<()>,
 }
 
 impl PersistentTask {
+    fn stage_destination_key(destination: Option<&Path>) -> String {
+        destination
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+
     pub fn new(
         task: CopyTask,
         progress: TaskProgress,
@@ -206,6 +274,7 @@ impl PersistentTask {
         file_system: Arc<dyn FileSystem>,
         checksum_provider: Arc<dyn ChecksumProvider>,
         artifact_store: Arc<dyn ArtifactStore>,
+        stage_registry: Option<Arc<dyn StageRegistry>>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(event_channel_capacity.max(1));
         let id = task.id.clone();
@@ -228,17 +297,222 @@ impl PersistentTask {
             file_system,
             checksum_provider,
             artifact_store,
+            stage_registry,
             execution_lock: AsyncMutex::new(()),
         }
     }
 
+    async fn load_stage_state(
+        &self,
+        source: &Path,
+        destination: Option<&Path>,
+        stage_id: StageId,
+    ) -> Result<Option<StageStateSpec>, CopyError> {
+        let row = sqlx::query(
+            "SELECT state_json FROM task_stage_states WHERE task_id = ? AND source_path = ? AND destination_path = ? AND stage_key = ?",
+        )
+        .bind(&self.id)
+        .bind(source.to_string_lossy().to_string())
+        .bind(Self::stage_destination_key(destination))
+        .bind(stage_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|err| sqlx_error("PersistentTask::load_stage_state", err))?;
+
+        row.map(|row| {
+            let state_json = row
+                .try_get::<String, _>("state_json")
+                .map_err(|err| sqlx_error("PersistentTask::load_stage_state_json", err))?;
+            decode_stage_state(&state_json)
+        })
+        .transpose()
+    }
+
+    async fn save_stage_state(
+        &self,
+        source: &Path,
+        destination: Option<&Path>,
+        stage_id: StageId,
+        state: &StageStateSpec,
+    ) -> Result<(), CopyError> {
+        let state_json = encode_stage_state(state)?;
+        sqlx::query(
+            "INSERT OR REPLACE INTO task_stage_states (task_id, source_path, destination_path, stage_key, state_json, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&self.id)
+        .bind(source.to_string_lossy().to_string())
+        .bind(Self::stage_destination_key(destination))
+        .bind(stage_id)
+        .bind(state_json)
+        .bind(now_unix_ms())
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sqlx_error("PersistentTask::save_stage_state", err))?;
+        Ok(())
+    }
+
+    async fn delete_stage_state(
+        &self,
+        source: &Path,
+        destination: Option<&Path>,
+        stage_id: StageId,
+    ) -> Result<(), CopyError> {
+        sqlx::query(
+            "DELETE FROM task_stage_states WHERE task_id = ? AND source_path = ? AND destination_path = ? AND stage_key = ?",
+        )
+        .bind(&self.id)
+        .bind(source.to_string_lossy().to_string())
+        .bind(Self::stage_destination_key(destination))
+        .bind(stage_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| sqlx_error("PersistentTask::delete_stage_state", err))?;
+        Ok(())
+    }
+
+    async fn restore_source_stage_states(
+        &self,
+        source: &Path,
+        pipeline: &SourceObserverPipeline,
+    ) -> Result<(), CopyError> {
+        for stage in &pipeline.stages {
+            if let Some(state) = self.load_stage_state(source, None, stage.id()).await? {
+                stage.restore_state(&state)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_source_stage_states(
+        &self,
+        source: &Path,
+        pipeline: &SourceObserverPipeline,
+    ) -> Result<(), CopyError> {
+        for stage in &pipeline.stages {
+            match stage.snapshot_state() {
+                Some(state) => {
+                    self.save_stage_state(source, None, stage.id(), &state)
+                        .await?;
+                }
+                None => {
+                    self.delete_stage_state(source, None, stage.id()).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_source_stage_states(
+        &self,
+        source: &Path,
+        pipeline: &SourceObserverPipeline,
+    ) -> Result<(), CopyError> {
+        for stage in &pipeline.stages {
+            self.delete_stage_state(source, None, stage.id()).await?;
+        }
+        Ok(())
+    }
+
+    async fn restore_post_write_stage_states(
+        &self,
+        source: &Path,
+        destination: &Path,
+        pipeline: &PostWritePipeline,
+    ) -> Result<(), CopyError> {
+        for stage in &pipeline.stages {
+            if let Some(state) = self
+                .load_stage_state(source, Some(destination), stage.id())
+                .await?
+            {
+                stage.restore_state(&state)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn persist_post_write_stage_states(
+        &self,
+        source: &Path,
+        destination: &Path,
+        pipeline: &PostWritePipeline,
+    ) -> Result<(), CopyError> {
+        for stage in &pipeline.stages {
+            match stage.snapshot_state() {
+                Some(state) => {
+                    self.save_stage_state(source, Some(destination), stage.id(), &state)
+                        .await?;
+                }
+                None => {
+                    self.delete_stage_state(source, Some(destination), stage.id())
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn clear_post_write_stage_states(
+        &self,
+        source: &Path,
+        destination: &Path,
+        pipeline: &PostWritePipeline,
+    ) -> Result<(), CopyError> {
+        for stage in &pipeline.stages {
+            self.delete_stage_state(source, Some(destination), stage.id())
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_file_plans(&self, file_plans: &[FilePlan]) -> Result<(), CopyError> {
+        let file_plans_json = serde_json::to_string(file_plans).map_err(|err| CopyError {
+            category: CopyErrorCategory::Io,
+            code: "SERDE_ERROR",
+            message: format!(
+                "failed to encode file plans for task '{}': {}",
+                self.id, err
+            ),
+        })?;
+
+        sqlx::query("UPDATE tasks SET file_plans_json = ? WHERE id = ?")
+            .bind(file_plans_json)
+            .bind(&self.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sqlx_error("PersistentTask::persist_file_plans", err))?;
+
+        Ok(())
+    }
+
     async fn persist_state(&self, state: TaskState) -> Result<(), CopyError> {
-        sqlx::query("UPDATE tasks SET state = ? WHERE id = ?")
+        let started_at_ms = matches!(state, TaskState::Preparing).then_some(now_unix_ms());
+        let finished_at_ms = state.is_terminal().then_some(now_unix_ms());
+
+        sqlx::query(
+            "UPDATE tasks SET state = ?, started_at_ms = COALESCE(started_at_ms, ?), finished_at_ms = ? WHERE id = ?",
+        )
             .bind(state_to_db_value(state))
+            .bind(started_at_ms)
+            .bind(finished_at_ms)
             .bind(&self.id)
             .execute(&self.pool)
             .await
             .map_err(|err| sqlx_error("PersistentTask::persist_state", err))?;
+        Ok(())
+    }
+
+    async fn increment_retry_count(&self, delta: u64) -> Result<(), CopyError> {
+        if delta == 0 {
+            return Ok(());
+        }
+
+        sqlx::query("UPDATE tasks SET retry_count = retry_count + ? WHERE id = ?")
+            .bind(delta as i64)
+            .bind(&self.id)
+            .execute(&self.pool)
+            .await
+            .map_err(|err| sqlx_error("PersistentTask::increment_retry_count", err))?;
+
         Ok(())
     }
 
@@ -297,6 +571,15 @@ impl PersistentTask {
             return Ok(snapshot.file_plans);
         }
 
+        let include_set = compile_glob_set(
+            &snapshot.options.include_patterns,
+            "PersistentTask::ensure_file_plans include_patterns",
+        )?;
+        let exclude_set = compile_glob_set(
+            &snapshot.options.exclude_patterns,
+            "PersistentTask::ensure_file_plans exclude_patterns",
+        )?;
+
         debug!(
             "task '{}' scanning source tree '{}'",
             self.id,
@@ -321,6 +604,10 @@ impl PersistentTask {
                     ),
                 })?;
 
+            if !source_matches_patterns(relative, include_set.as_ref(), exclude_set.as_ref()) {
+                continue;
+            }
+
             let destinations = snapshot
                 .destinations
                 .iter()
@@ -344,6 +631,7 @@ impl PersistentTask {
             });
         }
 
+        self.persist_file_plans(&plans).await?;
         self.set_file_plans(plans.clone())?;
         Ok(plans)
     }
@@ -842,66 +1130,106 @@ impl PersistentTask {
         Ok((copy_branches, completed_results))
     }
 
-    fn build_effective_source_observer_pipeline(
+    fn build_source_stage_from_spec(
         &self,
-        snapshot: &CopyTask,
-    ) -> Option<SourceObserverPipeline> {
-        let mut pipeline =
-            snapshot.flow.source_observer.clone().unwrap_or_else(|| {
-                SourceObserverPipeline::new(snapshot.flow.source_pipeline_mode())
-            });
-        pipeline.mode = snapshot.flow.source_pipeline_mode();
+        spec: &StageSpec,
+    ) -> Result<Arc<dyn SourceObserverStage>, CopyError> {
+        match spec.kind.as_str() {
+            "builtin-source-hash" => Ok(Arc::new(SourceHashStage::new(Arc::clone(
+                &self.checksum_provider,
+            )))),
+            _ => {
+                let registry = self.stage_registry.as_ref().ok_or(CopyError {
+                    category: CopyErrorCategory::NotImplemented,
+                    code: "STAGE_REGISTRY_MISSING",
+                    message: format!(
+                        "task '{}' requires a stage registry to rebuild source observer stage '{}'",
+                        self.id, spec.kind
+                    ),
+                })?;
 
-        if snapshot
-            .options
-            .verification_policy
-            .requires_post_write_verification()
-            || snapshot
-                .options
-                .verification_policy
-                .requires_source_hash_observer()
-        {
-            pipeline
-                .stages
-                .push(Arc::new(SourceHashStage::new(Arc::clone(
-                    &self.checksum_provider,
-                ))));
-        }
-
-        if pipeline.stages.is_empty() {
-            None
-        } else {
-            Some(pipeline)
+                registry
+                    .build_source_observer_stage(spec)?
+                    .ok_or(CopyError {
+                        category: CopyErrorCategory::NotImplemented,
+                        code: "STAGE_SPEC_UNRESOLVED",
+                        message: format!(
+                            "task '{}' source observer stage '{}' could not be rebuilt from persisted config",
+                            self.id, spec.kind
+                        ),
+                    })
+            }
         }
     }
 
-    fn build_effective_post_write_pipeline(
+    fn build_post_write_stage_from_spec(
         &self,
-        snapshot: &CopyTask,
-    ) -> Option<PostWritePipeline> {
-        let mut pipeline =
-            snapshot.flow.post_write.clone().unwrap_or_else(|| {
-                PostWritePipeline::new(snapshot.flow.post_write_pipeline_mode())
-            });
-        pipeline.mode = snapshot.flow.post_write_pipeline_mode();
+        spec: &StageSpec,
+    ) -> Result<Arc<dyn crate::pipeline::PostWriteStage>, CopyError> {
+        match spec.kind.as_str() {
+            "builtin-destination-checksum-verify" => Ok(Arc::new(
+                DestinationChecksumVerifyStage::new(Arc::clone(&self.checksum_provider)),
+            )),
+            _ => {
+                let registry = self.stage_registry.as_ref().ok_or(CopyError {
+                    category: CopyErrorCategory::NotImplemented,
+                    code: "STAGE_REGISTRY_MISSING",
+                    message: format!(
+                        "task '{}' requires a stage registry to rebuild post-write stage '{}'",
+                        self.id, spec.kind
+                    ),
+                })?;
 
-        if snapshot
-            .options
-            .verification_policy
-            .requires_post_write_verification()
+                registry.build_post_write_stage(spec)?.ok_or(CopyError {
+                    category: CopyErrorCategory::NotImplemented,
+                    code: "STAGE_SPEC_UNRESOLVED",
+                    message: format!(
+                        "task '{}' post-write stage '{}' could not be rebuilt from persisted config",
+                        self.id, spec.kind
+                    ),
+                })
+            }
+        }
+    }
+
+    fn build_flow_from_spec(&self, flow_spec: &TaskFlowSpec) -> Result<TaskFlowPlan, CopyError> {
+        let mut flow = TaskFlowPlan::default();
+
+        if let Some(SourceObserverPipelineSpec { mode, stages }) =
+            flow_spec.source_observer.as_ref()
         {
-            pipeline
-                .stages
-                .push(Arc::new(DestinationChecksumVerifyStage::new(Arc::clone(
-                    &self.checksum_provider,
-                ))));
+            let mut pipeline = SourceObserverPipeline::new(*mode);
+            for stage in stages {
+                pipeline = pipeline.with_stage(self.build_source_stage_from_spec(stage)?);
+            }
+            flow = flow.with_source_observer(pipeline);
         }
 
-        if pipeline.stages.is_empty() {
-            None
-        } else {
-            Some(pipeline)
+        if let Some(PostWritePipelineSpec { mode, stages }) = flow_spec.post_write.as_ref() {
+            let mut pipeline = PostWritePipeline::new(*mode);
+            for stage in stages {
+                pipeline = pipeline.with_stage(self.build_post_write_stage_from_spec(stage)?);
+            }
+            flow = flow.with_post_write(pipeline);
         }
+
+        Ok(flow)
+    }
+
+    fn resolve_effective_flow(&self, snapshot: &CopyTask) -> Result<TaskFlowPlan, CopyError> {
+        let mut flow = if snapshot.flow.has_runtime_stages() {
+            snapshot.flow.clone()
+        } else if let Some(flow_spec) = snapshot.flow_spec.as_ref() {
+            self.build_flow_from_spec(flow_spec)?
+        } else {
+            TaskFlowPlan::default()
+        };
+
+        flow = flow
+            .with_source_pipeline_mode(snapshot.flow.source_pipeline_mode())
+            .with_post_write_pipeline_mode(snapshot.flow.post_write_pipeline_mode());
+
+        Ok(flow)
     }
 
     async fn source_fingerprint(&self, source: &Path) -> Result<SourceFingerprint, CopyError> {
@@ -988,6 +1316,12 @@ impl PersistentTask {
         let mut buffer = vec![0_u8; options.buffer_size_bytes.max(1)];
         let mut offset = 0_u64;
 
+        for stage in &pipeline.stages {
+            stage.reset_progress(plan.expected_size_bytes);
+        }
+        self.restore_source_stage_states(&plan.source, pipeline)
+            .await?;
+
         loop {
             let read_len = reader.read(&mut buffer).await.map_err(|err| {
                 io_error(
@@ -1008,12 +1342,17 @@ impl PersistentTask {
             for stage in &pipeline.stages {
                 stage.observe_chunk(task, plan, &chunk).await?;
             }
+
+            self.persist_source_stage_states(&plan.source, pipeline)
+                .await?;
         }
 
         let mut artifacts = PipelineArtifacts::new();
         for stage in &pipeline.stages {
             artifacts.insert_stage_output(stage.id(), stage.finish(task, plan).await?);
         }
+        self.clear_source_stage_states(&plan.source, pipeline)
+            .await?;
         Ok(artifacts)
     }
 
@@ -1204,6 +1543,10 @@ impl PersistentTask {
         if let Some(observer_pipeline) = observer_pipeline {
             for stage in &observer_pipeline.stages {
                 stage.reset_progress(file_plan.expected_size_bytes);
+            }
+            self.restore_source_stage_states(&file_plan.source, observer_pipeline)
+                .await?;
+            for stage in &observer_pipeline.stages {
                 let (tx, rx) = mpsc::channel::<BranchMessage>(4);
                 observer_senders.push((stage.id().to_string(), tx));
                 let branch_name = format!(
@@ -1317,6 +1660,11 @@ impl PersistentTask {
                     continue;
                 }
                 observer_index += 1;
+            }
+
+            if let Some(observer_pipeline) = observer_pipeline {
+                self.persist_source_stage_states(&file_plan.source, observer_pipeline)
+                    .await?;
             }
         }
 
@@ -1432,6 +1780,11 @@ impl PersistentTask {
         )
         .await?;
 
+        if let Some(observer_pipeline) = observer_pipeline {
+            self.clear_source_stage_states(&file_plan.source, observer_pipeline)
+                .await?;
+        }
+
         Ok(FanOutAttemptResult::Completed {
             observer_artifacts,
             branch_results,
@@ -1477,52 +1830,7 @@ impl PersistentTask {
             return Ok(results);
         };
 
-        let transfer_progress = branches
-            .iter()
-            .map(|branch| {
-                let actual_destination = branch
-                    .actual_destination_path
-                    .clone()
-                    .unwrap_or_else(|| branch.destination_path.clone());
-                ActiveTransferProgress {
-                    source_path: source.to_path_buf(),
-                    destination_path: branch.destination_path.clone(),
-                    actual_destination_path: Some(actual_destination),
-                    bytes_copied: branch.bytes_written,
-                    expected_bytes: branch.bytes_written,
-                    phase: TransferPhase::PostWrite,
-                }
-            })
-            .collect::<Vec<_>>();
-        for stage in &pipeline.stages {
-            stage.reset_progress(Some(
-                branches
-                    .iter()
-                    .map(|branch| branch.bytes_written)
-                    .max()
-                    .unwrap_or(0),
-            ));
-        }
-        let mut stage_progresses = self.collect_post_write_stage_progresses(
-            source,
-            Some(pipeline),
-            Some(
-                branches
-                    .iter()
-                    .map(|branch| branch.bytes_written)
-                    .max()
-                    .unwrap_or(0),
-            ),
-        );
-        self.publish_detailed_progress(
-            total_bytes,
-            base_complete_bytes,
-            transfer_progress.clone(),
-            stage_progresses.clone(),
-        )
-        .await?;
-
-        let mut join_set = JoinSet::new();
+        let mut results = Vec::new();
         for branch in branches {
             for stage in &pipeline.stages {
                 stage.reset_progress(Some(branch.bytes_written));
@@ -1532,6 +1840,8 @@ impl PersistentTask {
                 .actual_destination_path
                 .clone()
                 .unwrap_or_else(|| requested.clone());
+            self.restore_post_write_stage_states(source, &actual, pipeline)
+                .await?;
             let expected_bytes = branch.bytes_written.max(
                 fs::metadata(source)
                     .await
@@ -1555,53 +1865,28 @@ impl PersistentTask {
                 .delete_destination_artifacts(&self.id, source, &actual)
                 .await?;
 
-            let source_path = source.to_path_buf();
-            let pipeline_artifacts = source_artifacts.clone();
-            let task_id = self.id.clone();
-            let stages = pipeline.stages.clone();
-            join_set.spawn(async move {
-                let ctx = PostWriteContext {
-                    task_id,
-                    source_path,
-                    requested_destination_path: requested,
-                    actual_destination_path: actual,
-                    bytes_written: branch.bytes_written,
-                    expected_bytes,
-                    pipeline_artifacts,
-                };
-                let mut stage_outputs = PipelineArtifacts::new();
-                let mut result = Ok(());
-                for stage in stages {
-                    let stage_key = stage.id();
-                    match stage.execute(&ctx).await {
-                        Ok(artifacts) => {
-                            stage_outputs.insert_stage_output(stage_key, artifacts);
-                        }
-                        Err(err) => {
-                            result = Err(err);
-                            break;
-                        }
-                    }
-                }
-                (ctx, stage_outputs, result)
-            });
-        }
-
-        let mut results = Vec::new();
-        while let Some(joined) = join_set.join_next().await {
-            let (ctx, stage_outputs, result) = joined.map_err(|err| CopyError {
-                category: CopyErrorCategory::Interrupted,
-                code: "POST_WRITE_JOIN_ERROR",
-                message: format!(
-                    "post-write branch for '{}' panicked or was cancelled: {}",
-                    source.display(),
-                    err
-                ),
-            })?;
-
-            let fallback_total = Some(ctx.expected_bytes.max(ctx.bytes_written));
-            stage_progresses =
-                self.collect_post_write_stage_progresses(source, Some(pipeline), fallback_total);
+            let ctx = PostWriteContext {
+                task_id: self.id.clone(),
+                source_path: source.to_path_buf(),
+                requested_destination_path: requested.clone(),
+                actual_destination_path: actual.clone(),
+                bytes_written: branch.bytes_written,
+                expected_bytes,
+                pipeline_artifacts: source_artifacts.clone(),
+            };
+            let transfer_progress = vec![ActiveTransferProgress {
+                source_path: source.to_path_buf(),
+                destination_path: requested.clone(),
+                actual_destination_path: Some(actual.clone()),
+                bytes_copied: branch.bytes_written,
+                expected_bytes: branch.bytes_written.max(expected_bytes),
+                phase: TransferPhase::PostWrite,
+            }];
+            let mut stage_progresses = self.collect_post_write_stage_progresses(
+                source,
+                Some(pipeline),
+                Some(expected_bytes),
+            );
 
             self.publish_detailed_progress(
                 total_bytes,
@@ -1610,6 +1895,37 @@ impl PersistentTask {
                 stage_progresses.clone(),
             )
             .await?;
+
+            let mut stage_outputs = PipelineArtifacts::new();
+            let mut result = Ok(());
+            for stage in &pipeline.stages {
+                let stage_key = stage.id();
+                match stage.execute(&ctx).await {
+                    Ok(artifacts) => {
+                        stage_outputs.insert_stage_output(stage_key, artifacts);
+                    }
+                    Err(err) => {
+                        result = Err(err);
+                        break;
+                    }
+                }
+
+                self.persist_post_write_stage_states(source, &actual, pipeline)
+                    .await?;
+
+                stage_progresses = self.collect_post_write_stage_progresses(
+                    source,
+                    Some(pipeline),
+                    Some(expected_bytes),
+                );
+                self.publish_detailed_progress(
+                    total_bytes,
+                    base_complete_bytes,
+                    transfer_progress.clone(),
+                    stage_progresses.clone(),
+                )
+                .await?;
+            }
 
             self.artifact_store
                 .save_destination_artifacts(
@@ -1622,6 +1938,12 @@ impl PersistentTask {
 
             match result {
                 Ok(()) => {
+                    self.clear_post_write_stage_states(
+                        source,
+                        &ctx.actual_destination_path,
+                        pipeline,
+                    )
+                    .await?;
                     self.update_checkpoint(
                         &ctx.source_path,
                         &ctx.requested_destination_path,
@@ -1645,6 +1967,12 @@ impl PersistentTask {
                     });
                 }
                 Err(err) => {
+                    self.persist_post_write_stage_states(
+                        source,
+                        &ctx.actual_destination_path,
+                        pipeline,
+                    )
+                    .await?;
                     self.update_checkpoint(
                         &ctx.source_path,
                         &ctx.requested_destination_path,
@@ -1670,9 +1998,6 @@ impl PersistentTask {
             }
         }
 
-        self.publish_detailed_progress(total_bytes, base_complete_bytes, Vec::new(), Vec::new())
-            .await?;
-
         Ok(results)
     }
 
@@ -1685,8 +2010,9 @@ impl PersistentTask {
         let options = snapshot.options.clone();
         let source = &file_plan.source;
         let expected_bytes = file_plan.expected_size_bytes.unwrap_or(0);
-        let source_observer_pipeline = self.build_effective_source_observer_pipeline(&snapshot);
-        let post_write_pipeline = self.build_effective_post_write_pipeline(&snapshot);
+        let effective_flow = self.resolve_effective_flow(&snapshot)?;
+        let source_observer_pipeline = effective_flow.source_observer.clone();
+        let post_write_pipeline = effective_flow.post_write.clone();
         let (total_bytes, base_complete_bytes) = self.checkpoint_progress_totals().await?;
         let (mut copy_branches, mut results) = self
             .resolve_destination_branches(source, rows, options.overwrite_policy)
@@ -1722,30 +2048,47 @@ impl PersistentTask {
         let max_retries = options.retry_policy.max_retries;
         while !copy_branches.is_empty() {
             let mut ready_branches = Vec::with_capacity(copy_branches.len());
+            let mut failed_retry_branches = Vec::new();
             for branch in &copy_branches {
                 if let Some(parent) = branch.actual_destination.parent() {
                     if let Err(err) = self.file_system.create_dir_all(parent).await {
-                        self.update_checkpoint(
-                            source,
-                            &branch.requested_destination,
-                            FileCheckpointStatus::Failed,
-                            DestinationCopyStatus::Failed,
-                            DestinationPostWriteStatus::NotRun,
-                            0,
-                            branch.expected_bytes,
-                            Some(&branch.actual_destination),
-                            Some(&err.message),
-                        )
-                        .await?;
-                        results.push(DestinationBranchResult {
-                            destination_path: branch.requested_destination.clone(),
-                            actual_destination_path: Some(branch.actual_destination.clone()),
-                            bytes_written: 0,
-                            copy_status: DestinationCopyStatus::Failed,
-                            post_write_status: DestinationPostWriteStatus::NotRun,
-                            error: Some(err),
-                            retries: attempt,
-                        });
+                        if attempt < max_retries {
+                            self.update_checkpoint(
+                                source,
+                                &branch.requested_destination,
+                                FileCheckpointStatus::Pending,
+                                DestinationCopyStatus::Pending,
+                                DestinationPostWriteStatus::Pending,
+                                0,
+                                branch.expected_bytes,
+                                Some(&branch.actual_destination),
+                                Some(&err.message),
+                            )
+                            .await?;
+                            failed_retry_branches.push(branch.clone());
+                        } else {
+                            self.update_checkpoint(
+                                source,
+                                &branch.requested_destination,
+                                FileCheckpointStatus::Failed,
+                                DestinationCopyStatus::Failed,
+                                DestinationPostWriteStatus::NotRun,
+                                0,
+                                branch.expected_bytes,
+                                Some(&branch.actual_destination),
+                                Some(&err.message),
+                            )
+                            .await?;
+                            results.push(DestinationBranchResult {
+                                destination_path: branch.requested_destination.clone(),
+                                actual_destination_path: Some(branch.actual_destination.clone()),
+                                bytes_written: 0,
+                                copy_status: DestinationCopyStatus::Failed,
+                                post_write_status: DestinationPostWriteStatus::NotRun,
+                                error: Some(err),
+                                retries: attempt,
+                            });
+                        }
                         continue;
                     }
                 }
@@ -1764,129 +2107,129 @@ impl PersistentTask {
                 ready_branches.push(branch.clone());
             }
 
-            if ready_branches.is_empty() {
-                break;
-            }
-            copy_branches = ready_branches;
+            if !ready_branches.is_empty() {
+                copy_branches = ready_branches;
 
-            let concurrent_source_observers = if source_artifacts.is_empty() {
-                source_observer_pipeline
-                    .as_ref()
-                    .filter(|pipeline| pipeline.mode == SourcePipelineMode::ConcurrentWithFanOut)
-            } else {
-                None
-            };
+                let concurrent_source_observers = if source_artifacts.is_empty() {
+                    source_observer_pipeline.as_ref().filter(|pipeline| {
+                        pipeline.mode == SourcePipelineMode::ConcurrentWithFanOut
+                    })
+                } else {
+                    None
+                };
 
-            match self
-                .fan_out_copy_attempt(
-                    &snapshot,
-                    file_plan,
-                    &copy_branches,
-                    concurrent_source_observers,
-                    total_bytes,
-                    base_complete_bytes,
-                )
-                .await?
-            {
-                FanOutAttemptResult::Stopped(outcome) => {
-                    for branch in &copy_branches {
-                        self.update_checkpoint(
-                            source,
-                            &branch.requested_destination,
-                            FileCheckpointStatus::Pending,
-                            DestinationCopyStatus::Pending,
-                            DestinationPostWriteStatus::Pending,
-                            0,
-                            branch.expected_bytes,
-                            Some(&branch.actual_destination),
-                            None,
-                        )
-                        .await?;
-                    }
-                    self.refresh_progress_from_checkpoints().await?;
-                    return Ok(FileSessionResult::Stopped(outcome));
-                }
-                FanOutAttemptResult::Completed {
-                    observer_artifacts,
-                    branch_results,
-                } => {
-                    if source_artifacts.is_empty() {
-                        source_artifacts = observer_artifacts;
-                        self.persist_source_artifacts(source, &source_artifacts)
+                match self
+                    .fan_out_copy_attempt(
+                        &snapshot,
+                        file_plan,
+                        &copy_branches,
+                        concurrent_source_observers,
+                        total_bytes,
+                        base_complete_bytes,
+                    )
+                    .await?
+                {
+                    FanOutAttemptResult::Stopped(outcome) => {
+                        for branch in &copy_branches {
+                            self.update_checkpoint(
+                                source,
+                                &branch.requested_destination,
+                                FileCheckpointStatus::Pending,
+                                DestinationCopyStatus::Pending,
+                                DestinationPostWriteStatus::Pending,
+                                0,
+                                branch.expected_bytes,
+                                Some(&branch.actual_destination),
+                                None,
+                            )
                             .await?;
+                        }
+                        self.refresh_progress_from_checkpoints().await?;
+                        return Ok(FileSessionResult::Stopped(outcome));
                     }
-                    let mut failed_retry_branches = Vec::new();
+                    FanOutAttemptResult::Completed {
+                        observer_artifacts,
+                        branch_results,
+                    } => {
+                        if source_artifacts.is_empty() {
+                            source_artifacts = observer_artifacts;
+                            self.persist_source_artifacts(source, &source_artifacts)
+                                .await?;
+                        }
 
-                    for mut result in branch_results {
-                        result.retries = attempt;
-                        match result.copy_status {
-                            DestinationCopyStatus::Succeeded => {
-                                results.push(result);
-                            }
-                            DestinationCopyStatus::Failed => {
-                                if attempt < max_retries {
-                                    self.update_checkpoint(
-                                        source,
-                                        &result.destination_path,
-                                        FileCheckpointStatus::Pending,
-                                        DestinationCopyStatus::Pending,
-                                        DestinationPostWriteStatus::Pending,
-                                        0,
-                                        expected_bytes,
-                                        result.actual_destination_path.as_deref(),
-                                        result.error.as_ref().map(|err| err.message.as_str()),
-                                    )
-                                    .await?;
-                                    failed_retry_branches.push(DestinationBranchPlan {
-                                        requested_destination: result.destination_path.clone(),
-                                        actual_destination: result
-                                            .actual_destination_path
-                                            .clone()
-                                            .unwrap_or_else(|| result.destination_path.clone()),
-                                        expected_bytes,
-                                    });
-                                } else {
-                                    self.update_checkpoint(
-                                        source,
-                                        &result.destination_path,
-                                        FileCheckpointStatus::Failed,
-                                        DestinationCopyStatus::Failed,
-                                        DestinationPostWriteStatus::NotRun,
-                                        0,
-                                        expected_bytes,
-                                        result.actual_destination_path.as_deref(),
-                                        result.error.as_ref().map(|err| err.message.as_str()),
-                                    )
-                                    .await?;
+                        for mut result in branch_results {
+                            result.retries = attempt;
+                            match result.copy_status {
+                                DestinationCopyStatus::Succeeded => {
                                     results.push(result);
                                 }
+                                DestinationCopyStatus::Failed => {
+                                    if attempt < max_retries {
+                                        self.update_checkpoint(
+                                            source,
+                                            &result.destination_path,
+                                            FileCheckpointStatus::Pending,
+                                            DestinationCopyStatus::Pending,
+                                            DestinationPostWriteStatus::Pending,
+                                            0,
+                                            expected_bytes,
+                                            result.actual_destination_path.as_deref(),
+                                            result.error.as_ref().map(|err| err.message.as_str()),
+                                        )
+                                        .await?;
+                                        failed_retry_branches.push(DestinationBranchPlan {
+                                            requested_destination: result.destination_path.clone(),
+                                            actual_destination: result
+                                                .actual_destination_path
+                                                .clone()
+                                                .unwrap_or_else(|| result.destination_path.clone()),
+                                            expected_bytes,
+                                        });
+                                    } else {
+                                        self.update_checkpoint(
+                                            source,
+                                            &result.destination_path,
+                                            FileCheckpointStatus::Failed,
+                                            DestinationCopyStatus::Failed,
+                                            DestinationPostWriteStatus::NotRun,
+                                            0,
+                                            expected_bytes,
+                                            result.actual_destination_path.as_deref(),
+                                            result.error.as_ref().map(|err| err.message.as_str()),
+                                        )
+                                        .await?;
+                                        results.push(result);
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
-
-                    if failed_retry_branches.is_empty() {
-                        break;
-                    }
-
-                    attempt = attempt.saturating_add(1);
-                    let factor = options.retry_policy.exponential_factor.max(1) as u64;
-                    let backoff = options
-                        .retry_policy
-                        .initial_backoff_ms
-                        .saturating_mul(factor.saturating_pow(attempt.saturating_sub(1)));
-                    warn!(
-                        "task '{}' retrying {} destination branches for '{}' in {} ms",
-                        self.id,
-                        failed_retry_branches.len(),
-                        source.display(),
-                        backoff
-                    );
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
-                    copy_branches = failed_retry_branches;
-                    continue;
                 }
             }
+
+            if failed_retry_branches.is_empty() {
+                break;
+            }
+
+            attempt = attempt.saturating_add(1);
+            let factor = options.retry_policy.exponential_factor.max(1) as u64;
+            let backoff = options
+                .retry_policy
+                .initial_backoff_ms
+                .saturating_mul(factor.saturating_pow(attempt.saturating_sub(1)));
+            warn!(
+                "task '{}' retrying {} destination branches for '{}' in {} ms",
+                self.id,
+                failed_retry_branches.len(),
+                source.display(),
+                backoff
+            );
+            self.increment_retry_count(failed_retry_branches.len() as u64)
+                .await?;
+            tokio::time::sleep(Duration::from_millis(backoff)).await;
+            copy_branches = failed_retry_branches;
+            continue;
         }
 
         let mut copied_results = Vec::new();
@@ -1918,19 +2261,58 @@ impl PersistentTask {
 
     async fn build_report(&self) -> Result<CopyReport, CopyError> {
         let checkpoints = self.load_checkpoints(false).await?;
+        let task_metrics = sqlx::query(
+            "SELECT retry_count, started_at_ms, finished_at_ms FROM tasks WHERE id = ?",
+        )
+        .bind(&self.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|err| sqlx_error("PersistentTask::build_report_task_metrics", err))?;
         let runtime = self
             .runtime
             .read()
             .map_err(|_| lock_poisoned_error("PersistentTask::build_report"))?;
 
+        let retry_count = task_metrics
+            .try_get::<i64, _>("retry_count")
+            .map_err(|err| sqlx_error("PersistentTask::build_report_retry_count", err))?
+            .max(0) as u64;
+        let started_at_ms = task_metrics
+            .try_get::<Option<i64>, _>("started_at_ms")
+            .map_err(|err| sqlx_error("PersistentTask::build_report_started_at_ms", err))?;
+        let finished_at_ms = task_metrics
+            .try_get::<Option<i64>, _>("finished_at_ms")
+            .map_err(|err| sqlx_error("PersistentTask::build_report_finished_at_ms", err))?;
+        let duration_ms = started_at_ms
+            .map(|started| {
+                finished_at_ms
+                    .unwrap_or_else(now_unix_ms)
+                    .saturating_sub(started)
+            })
+            .unwrap_or(0)
+            .max(0) as u128;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum FileReportState {
+            InProgress,
+            Succeeded,
+            Failed,
+        }
+
         let mut destinations = Vec::with_capacity(checkpoints.len());
         let mut failures = Vec::new();
-        let mut by_source: HashMap<PathBuf, bool> = HashMap::new();
+        let mut by_source: HashMap<PathBuf, FileReportState> = HashMap::new();
 
         for row in checkpoints {
             let source_path = PathBuf::from(row.source_path);
             let destination_path = PathBuf::from(row.destination_path);
             let actual_destination_path = row.actual_destination_path.map(PathBuf::from);
+            let checkpoint_status =
+                checkpoint_status_from_db_value(&row.status).ok_or(CopyError {
+                    category: CopyErrorCategory::Unknown,
+                    code: "INVALID_FILE_CHECKPOINT_STATUS",
+                    message: format!("unknown checkpoint status '{}'", row.status),
+                })?;
             let copy_status = copy_status_from_db_value(&row.copy_status).ok_or(CopyError {
                 category: CopyErrorCategory::Unknown,
                 code: "INVALID_COPY_STATUS",
@@ -1960,10 +2342,29 @@ impl PersistentTask {
 
             let failed = copy_status == DestinationCopyStatus::Failed
                 || post_write_status == DestinationPostWriteStatus::Failed;
+            let destination_state = if failed {
+                FileReportState::Failed
+            } else if checkpoint_status == FileCheckpointStatus::Completed {
+                FileReportState::Succeeded
+            } else {
+                FileReportState::InProgress
+            };
             by_source
                 .entry(source_path.clone())
-                .and_modify(|value| *value |= failed)
-                .or_insert(failed);
+                .and_modify(|value| {
+                    *value = match (*value, destination_state) {
+                        (FileReportState::Failed, _) | (_, FileReportState::Failed) => {
+                            FileReportState::Failed
+                        }
+                        (FileReportState::InProgress, _) | (_, FileReportState::InProgress) => {
+                            FileReportState::InProgress
+                        }
+                        (FileReportState::Succeeded, FileReportState::Succeeded) => {
+                            FileReportState::Succeeded
+                        }
+                    }
+                })
+                .or_insert(destination_state);
 
             destinations.push(DestinationReport {
                 source_path,
@@ -1976,9 +2377,15 @@ impl PersistentTask {
             });
         }
 
-        let failed_files = by_source.values().filter(|failed| **failed).count() as u64;
+        let failed_files = by_source
+            .values()
+            .filter(|state| **state == FileReportState::Failed)
+            .count() as u64;
         let total_files = runtime.snapshot.file_plans.len() as u64;
-        let succeeded_files = total_files.saturating_sub(failed_files);
+        let succeeded_files = by_source
+            .values()
+            .filter(|state| **state == FileReportState::Succeeded)
+            .count() as u64;
 
         Ok(CopyReport {
             snapshot: runtime.snapshot.clone(),
@@ -1987,8 +2394,8 @@ impl PersistentTask {
             failed_files,
             total_bytes: runtime.progress.total_bytes,
             complete_bytes: runtime.progress.complete_bytes,
-            duration_ms: 0,
-            retry_count: 0,
+            duration_ms,
+            retry_count,
             failures,
             destinations,
         })
@@ -2061,11 +2468,12 @@ impl PersistentTask {
         match current {
             TaskState::Created => {
                 self.transition_state(TaskState::Planned).await?;
-                self.transition_state(TaskState::Running).await?;
+                self.transition_state(TaskState::Preparing).await?;
             }
             TaskState::Planned | TaskState::Paused => {
-                self.transition_state(TaskState::Running).await?;
+                self.transition_state(TaskState::Preparing).await?;
             }
+            TaskState::Preparing => {}
             TaskState::Running => {}
             TaskState::Completed
             | TaskState::PartialFailed
@@ -2079,6 +2487,10 @@ impl PersistentTask {
         self.ensure_checkpoints_seeded(&file_plans).await?;
         self.refresh_progress_from_checkpoints().await?;
 
+        if self.state().await? == TaskState::Preparing {
+            self.transition_state(TaskState::Running).await?;
+        }
+
         match self.execute_copy_workload().await {
             Ok(RunOutcome::Continue) => Ok(()),
             Ok(RunOutcome::Paused) => {
@@ -2090,7 +2502,10 @@ impl PersistentTask {
                 Ok(())
             }
             Err(err) => {
-                if self.state().await.unwrap_or(TaskState::Failed) == TaskState::Running {
+                if matches!(
+                    self.state().await.unwrap_or(TaskState::Failed),
+                    TaskState::Preparing | TaskState::Running
+                ) {
                     let _ = self.transition_state(TaskState::Failed).await;
                 }
                 error!("task '{}' failed: {}", self.id, err.message);
@@ -2112,6 +2527,7 @@ fn state_to_db_value(state: TaskState) -> &'static str {
     match state {
         TaskState::Created => "created",
         TaskState::Planned => "planned",
+        TaskState::Preparing => "preparing",
         TaskState::Running => "running",
         TaskState::Completed => "completed",
         TaskState::PartialFailed => "partial_failed",
@@ -2206,11 +2622,210 @@ impl Task for PersistentTask {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use std::sync::Arc;
+
+    use sqlx::SqlitePool;
+
     use std::path::PathBuf;
 
-    use crate::domain::{ActiveTransferProgress, TransferPhase};
+    use crate::domain::{
+        ActiveTransferProgress, CopyTask, DestinationCopyStatus, DestinationPostWriteStatus,
+        FilePlan, TaskOptions, TaskProgress, TaskState, TransferPhase,
+    };
+    use crate::infrastructure::{FileSystem, LocalFileSystem, Sha256ChecksumProvider};
+    use crate::orchestrator::artifact_store::ArtifactStore;
+    use crate::orchestrator::orchestrator_sqlite::{
+        TASKS_SCHEMA_SQL, TASK_FILE_CHECKPOINTS_SCHEMA_SQL,
+    };
+    use crate::orchestrator::sqlite_artifact_store::{
+        SqliteArtifactStore, TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL,
+        TASK_SOURCE_ARTIFACTS_SCHEMA_SQL, TASK_STAGE_STATES_SCHEMA_SQL,
+    };
+    use crate::orchestrator::task::Task;
+    use crate::pipeline::PipelineArtifacts;
 
     use super::PersistentTask;
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "sure-copy-core-{}-{}-{}",
+            label,
+            std::process::id(),
+            super::now_unix_ms()
+        ));
+        std::fs::create_dir_all(&path).expect("test directory should be creatable");
+        path
+    }
+
+    async fn setup_persistent_task(task: CopyTask) -> PersistentTask {
+        setup_persistent_task_with_file_system(task, Arc::new(LocalFileSystem::new())).await
+    }
+
+    async fn setup_persistent_task_with_file_system(
+        task: CopyTask,
+        file_system: Arc<dyn FileSystem>,
+    ) -> PersistentTask {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("sqlite in-memory database should connect");
+
+        sqlx::query(TASKS_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("tasks table should be created");
+        sqlx::query(TASK_FILE_CHECKPOINTS_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("checkpoints table should be created");
+        sqlx::query(TASK_SOURCE_ARTIFACTS_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("source artifacts table should be created");
+        sqlx::query(TASK_DESTINATION_ARTIFACTS_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("destination artifacts table should be created");
+        sqlx::query(TASK_STAGE_STATES_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("stage states table should be created");
+
+        sqlx::query(
+            "INSERT INTO tasks (id, source_root, destinations_json, spec_json, file_plans_json, state, total_bytes, complete_bytes, retry_count, started_at_ms, finished_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task.id)
+        .bind(task.source_root.to_string_lossy().to_string())
+        .bind(
+            serde_json::to_string(
+                &task
+                    .destinations
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("destinations json should encode"),
+        )
+        .bind("{}")
+        .bind(
+            serde_json::to_string(&task.file_plans).expect("file plans json should encode"),
+        )
+        .bind(super::state_to_db_value(task.state))
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(0_i64)
+        .bind(Option::<i64>::None)
+        .bind(Option::<i64>::None)
+        .execute(&pool)
+        .await
+        .expect("task row should be inserted");
+
+        let artifact_store: Arc<dyn ArtifactStore> =
+            Arc::new(SqliteArtifactStore::new(pool.clone()));
+
+        PersistentTask::new(
+            task,
+            TaskProgress::default(),
+            8,
+            pool,
+            file_system,
+            Arc::new(Sha256ChecksumProvider::new()),
+            artifact_store,
+            None,
+        )
+    }
+
+    #[derive(Default)]
+    struct FailOnceCreateDirFileSystem {
+        delegate: LocalFileSystem,
+        remaining_failures: Mutex<usize>,
+    }
+
+    impl FailOnceCreateDirFileSystem {
+        fn new(failures: usize) -> Self {
+            Self {
+                delegate: LocalFileSystem::new(),
+                remaining_failures: Mutex::new(failures),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl FileSystem for FailOnceCreateDirFileSystem {
+        async fn exists(&self, path: &std::path::Path) -> Result<bool, crate::domain::CopyError> {
+            self.delegate.exists(path).await
+        }
+
+        async fn create_dir_all(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<(), crate::domain::CopyError> {
+            let should_fail = {
+                let mut remaining = self
+                    .remaining_failures
+                    .lock()
+                    .expect("remaining_failures lock should not be poisoned");
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+
+            if should_fail {
+                return Err(crate::domain::CopyError {
+                    category: crate::domain::CopyErrorCategory::Io,
+                    code: "INJECTED_CREATE_DIR_ALL_ERROR",
+                    message: format!(
+                        "simulated transient create_dir_all failure for '{}'",
+                        path.display()
+                    ),
+                });
+            }
+            self.delegate.create_dir_all(path).await
+        }
+
+        async fn read_dir_recursive(
+            &self,
+            path: &std::path::Path,
+        ) -> Result<Vec<PathBuf>, crate::domain::CopyError> {
+            self.delegate.read_dir_recursive(path).await
+        }
+    }
+
+    async fn insert_checkpoint(
+        task: &PersistentTask,
+        source: &std::path::Path,
+        destination: &std::path::Path,
+        status: &str,
+        copy_status: &str,
+        post_write_status: &str,
+        bytes_copied: i64,
+        expected_bytes: i64,
+        actual_destination_path: Option<&std::path::Path>,
+        last_error: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO task_file_checkpoints (task_id, source_path, destination_path, status, copy_status, post_write_status, bytes_copied, expected_bytes, actual_destination_path, last_error, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&task.id)
+        .bind(source.to_string_lossy().to_string())
+        .bind(destination.to_string_lossy().to_string())
+        .bind(status)
+        .bind(copy_status)
+        .bind(post_write_status)
+        .bind(bytes_copied)
+        .bind(expected_bytes)
+        .bind(actual_destination_path.map(|path| path.to_string_lossy().to_string()))
+        .bind(last_error)
+        .bind(super::now_unix_ms())
+        .execute(&task.pool)
+        .await
+        .expect("checkpoint row should insert");
+    }
 
     #[test]
     fn compose_complete_bytes_clamps_to_total_bytes() {
@@ -2240,5 +2855,319 @@ mod tests {
 
         let complete = PersistentTask::compose_complete_bytes(200, 40, &transfers);
         assert_eq!(complete, 90);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_reusable_source_artifacts_deletes_stale_rows() {
+        let source_root = unique_test_dir("persistent-task-stale-artifacts-src");
+        let destination_root = unique_test_dir("persistent-task-stale-artifacts-dst");
+        let source_path = source_root.join("file.txt");
+        std::fs::write(&source_path, "alpha").expect("source file should be writable");
+
+        let task = setup_persistent_task(CopyTask::new(
+            "stale-artifacts-task",
+            source_root.clone(),
+            vec![destination_root],
+            TaskOptions::default(),
+        ))
+        .await;
+
+        let mut artifacts = PipelineArtifacts::new();
+        artifacts.insert_stage_output(
+            "stage-a",
+            crate::pipeline::StageArtifacts::new().with_value("checksum", "abc"),
+        );
+        task.persist_source_artifacts(&source_path, &artifacts)
+            .await
+            .expect("source artifacts should persist");
+
+        std::fs::write(&source_path, "alpha-updated")
+            .expect("source file should be writable after update");
+
+        let reused = task
+            .load_reusable_source_artifacts(&source_path)
+            .await
+            .expect("loading reusable artifacts should succeed");
+        assert!(reused.is_none(), "stale artifacts should not be reused");
+
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM task_source_artifacts WHERE task_id = ? AND source_path = ?",
+        )
+        .bind(&task.id)
+        .bind(source_path.to_string_lossy().to_string())
+        .fetch_one(&task.pool)
+        .await
+        .expect("artifact count query should succeed");
+        assert_eq!(remaining, 0, "stale artifact rows should be deleted");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn checkpoint_progress_totals_use_max_of_expected_and_copied_bytes() {
+        let source_root = unique_test_dir("persistent-task-checkpoint-progress-src");
+        let destination_root = unique_test_dir("persistent-task-checkpoint-progress-dst");
+        let source_a = source_root.join("a.txt");
+        let source_b = source_root.join("b.txt");
+        let destination_a = destination_root.join("a.txt");
+        let destination_b = destination_root.join("b.txt");
+
+        let task = setup_persistent_task(CopyTask::new(
+            "checkpoint-progress-task",
+            source_root,
+            vec![destination_root],
+            TaskOptions::default(),
+        ))
+        .await;
+
+        insert_checkpoint(
+            &task,
+            &source_a,
+            &destination_a,
+            "completed",
+            "succeeded",
+            "not_run",
+            10,
+            5,
+            Some(&destination_a),
+            None,
+        )
+        .await;
+        insert_checkpoint(
+            &task,
+            &source_b,
+            &destination_b,
+            "writing",
+            "pending",
+            "pending",
+            8,
+            20,
+            Some(&destination_b),
+            None,
+        )
+        .await;
+
+        let (total_bytes, complete_bytes) = task
+            .checkpoint_progress_totals()
+            .await
+            .expect("checkpoint totals should compute");
+        assert_eq!(total_bytes, 30);
+        assert_eq!(complete_bytes, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_report_uses_actual_destination_for_failure_path() {
+        let source_root = unique_test_dir("persistent-task-report-failure-src");
+        let destination_root = unique_test_dir("persistent-task-report-failure-dst");
+        let source_path = source_root.join("file.txt");
+        let requested_destination = destination_root.join("file.txt");
+        let actual_destination = destination_root.join("file (1).txt");
+        std::fs::write(&source_path, "payload").expect("source file should be writable");
+
+        let task = setup_persistent_task(
+            CopyTask::new(
+                "report-failure-task",
+                source_root,
+                vec![destination_root.clone()],
+                TaskOptions::default(),
+            )
+            .with_file_plans(vec![FilePlan {
+                source: source_path.clone(),
+                destinations: vec![requested_destination.clone()],
+                expected_size_bytes: Some(7),
+                expected_checksum: None,
+            }]),
+        )
+        .await;
+
+        insert_checkpoint(
+            &task,
+            &source_path,
+            &requested_destination,
+            "failed",
+            "failed",
+            "not_run",
+            0,
+            7,
+            Some(&actual_destination),
+            Some("copy exploded"),
+        )
+        .await;
+
+        let report = task.build_report().await.expect("report should build");
+        assert_eq!(report.failed_files, 1);
+        assert_eq!(report.succeeded_files, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].path, actual_destination);
+        assert_eq!(report.destinations.len(), 1);
+        assert_eq!(
+            report.destinations[0].actual_destination_path,
+            Some(destination_root.join("file (1).txt"))
+        );
+        assert_eq!(
+            report.destinations[0].copy_status,
+            DestinationCopyStatus::Failed
+        );
+        assert_eq!(
+            report.destinations[0].post_write_status,
+            DestinationPostWriteStatus::NotRun
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_report_rejects_invalid_copy_status_values() {
+        let source_root = unique_test_dir("persistent-task-invalid-report-src");
+        let destination_root = unique_test_dir("persistent-task-invalid-report-dst");
+        let source_path = source_root.join("file.txt");
+        let destination_path = destination_root.join("file.txt");
+
+        let task = setup_persistent_task(
+            CopyTask::new(
+                "invalid-report-task",
+                source_root,
+                vec![destination_root],
+                TaskOptions::default(),
+            )
+            .with_file_plans(vec![FilePlan {
+                source: source_path.clone(),
+                destinations: vec![destination_path.clone()],
+                expected_size_bytes: Some(1),
+                expected_checksum: None,
+            }]),
+        )
+        .await;
+
+        insert_checkpoint(
+            &task,
+            &source_path,
+            &destination_path,
+            "completed",
+            "mystery-status",
+            "not_run",
+            1,
+            1,
+            Some(&destination_path),
+            None,
+        )
+        .await;
+
+        let err = match task.build_report().await {
+            Ok(_) => panic!("invalid copy status should fail report building"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code, "INVALID_COPY_STATUS");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn build_report_counts_only_fully_completed_files_as_succeeded() {
+        let source_root = unique_test_dir("persistent-task-report-success-count-src");
+        let destination_root = unique_test_dir("persistent-task-report-success-count-dst");
+        let source_a = source_root.join("a.txt");
+        let source_b = source_root.join("b.txt");
+        let destination_a = destination_root.join("a.txt");
+        let destination_b = destination_root.join("b.txt");
+
+        let task = setup_persistent_task(
+            CopyTask::new(
+                "report-success-count-task",
+                source_root,
+                vec![destination_root],
+                TaskOptions::default(),
+            )
+            .with_file_plans(vec![
+                FilePlan {
+                    source: source_a.clone(),
+                    destinations: vec![destination_a.clone()],
+                    expected_size_bytes: Some(1),
+                    expected_checksum: None,
+                },
+                FilePlan {
+                    source: source_b.clone(),
+                    destinations: vec![destination_b.clone()],
+                    expected_size_bytes: Some(1),
+                    expected_checksum: None,
+                },
+            ]),
+        )
+        .await;
+
+        insert_checkpoint(
+            &task,
+            &source_a,
+            &destination_a,
+            "completed",
+            "succeeded",
+            "not_run",
+            1,
+            1,
+            Some(&destination_a),
+            None,
+        )
+        .await;
+        insert_checkpoint(
+            &task,
+            &source_b,
+            &destination_b,
+            "writing",
+            "pending",
+            "pending",
+            0,
+            1,
+            Some(&destination_b),
+            None,
+        )
+        .await;
+
+        let report = task.build_report().await.expect("report should build");
+        assert_eq!(report.total_files, 2);
+        assert_eq!(report.succeeded_files, 1);
+        assert_eq!(report.failed_files, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_retries_transient_create_dir_all_failures() {
+        let source_root = unique_test_dir("persistent-task-retry-create-dir-src");
+        let destination_root = unique_test_dir("persistent-task-retry-create-dir-dst");
+        let source_path = source_root.join("nested/file.txt");
+        let destination_path = destination_root.join("deep/file.txt");
+        std::fs::create_dir_all(source_path.parent().expect("source parent should exist"))
+            .expect("source parent directory should be creatable");
+        std::fs::write(&source_path, "retry me").expect("source file should be writable");
+
+        let mut options = TaskOptions::default();
+        options.retry_policy.max_retries = 1;
+        options.retry_policy.initial_backoff_ms = 0;
+        options.retry_policy.exponential_factor = 1;
+
+        let task = setup_persistent_task_with_file_system(
+            CopyTask::new(
+                "retry-create-dir-task",
+                source_root,
+                vec![destination_root],
+                options,
+            )
+            .with_state(TaskState::Created)
+            .with_file_plans(vec![FilePlan {
+                source: source_path.clone(),
+                destinations: vec![destination_path.clone()],
+                expected_size_bytes: Some(8),
+                expected_checksum: None,
+            }]),
+            Arc::new(FailOnceCreateDirFileSystem::new(1)),
+        )
+        .await;
+
+        task.run().await.expect("task should recover after retry");
+        assert_eq!(
+            task.state().await.expect("state should load"),
+            TaskState::Completed
+        );
+        assert_eq!(
+            std::fs::read_to_string(&destination_path).expect("destination should be readable"),
+            "retry me"
+        );
+
+        let report = task.report().await.expect("report should build");
+        assert_eq!(report.retry_count, 1);
+        assert_eq!(report.succeeded_files, 1);
+        assert_eq!(report.failed_files, 0);
     }
 }

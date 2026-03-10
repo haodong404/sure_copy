@@ -8,6 +8,64 @@ use serde_json::Value as JsonValue;
 /// Stable identifier for a runtime stage.
 pub type StageId = &'static str;
 
+/// Durable description of one stage instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StageSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub config: JsonValue,
+}
+
+impl StageSpec {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            config: JsonValue::Null,
+        }
+    }
+
+    pub fn with_config(mut self, config: JsonValue) -> Self {
+        self.config = config;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SourceObserverPipelineSpec {
+    #[serde(default)]
+    pub mode: SourcePipelineMode,
+    #[serde(default)]
+    pub stages: Vec<StageSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct PostWritePipelineSpec {
+    #[serde(default)]
+    pub mode: PostWritePipelineMode,
+    #[serde(default)]
+    pub stages: Vec<StageSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TaskFlowSpec {
+    #[serde(default)]
+    pub source_observer: Option<SourceObserverPipelineSpec>,
+    #[serde(default)]
+    pub post_write: Option<PostWritePipelineSpec>,
+}
+
+impl TaskFlowSpec {
+    pub fn is_empty(&self) -> bool {
+        self.source_observer
+            .as_ref()
+            .is_none_or(|pipeline| pipeline.stages.is_empty())
+            && self
+                .post_write
+                .as_ref()
+                .is_none_or(|pipeline| pipeline.stages.is_empty())
+    }
+}
+
 /// Defines how source-side observer stages run relative to destination writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourcePipelineMode {
@@ -120,6 +178,28 @@ impl From<bool> for ArtifactValue {
 impl From<JsonValue> for ArtifactValue {
     fn from(value: JsonValue) -> Self {
         Self::Json(value)
+    }
+}
+
+/// Durable snapshot of one stage's resumable internal state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct StageStateSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub state: JsonValue,
+}
+
+impl StageStateSpec {
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            kind: kind.into(),
+            state: JsonValue::Null,
+        }
+    }
+
+    pub fn with_state(mut self, state: JsonValue) -> Self {
+        self.state = state;
+        self
     }
 }
 

@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS task_destination_artifacts (
 );
 "#;
 
+pub(crate) const TASK_STAGE_STATES_SCHEMA_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS task_stage_states (
+    task_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    destination_path TEXT NOT NULL DEFAULT '',
+    stage_key TEXT NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (task_id, source_path, destination_path, stage_key)
+);
+"#;
+
 fn db_error(context: &'static str, err: sqlx::Error) -> CopyError {
     CopyError {
         category: CopyErrorCategory::Io,
@@ -280,6 +292,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("destination artifacts schema should be created");
+        sqlx::query(TASK_STAGE_STATES_SCHEMA_SQL)
+            .execute(&pool)
+            .await
+            .expect("stage states schema should be created");
 
         SqliteArtifactStore::new(pool)
     }
@@ -433,5 +449,93 @@ mod tests {
             .await
             .expect_err("mismatched fingerprint rows must fail");
         assert_eq!(err.code, "ARTIFACT_FINGERPRINT_MISMATCH");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_source_artifacts_rejects_invalid_artifact_json() {
+        let store = setup_store().await;
+        let source = Path::new("/src/file.txt");
+
+        sqlx::query(
+            "INSERT INTO task_source_artifacts (task_id, source_path, stage_key, artifacts_json, source_fingerprint_json, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("task-1")
+        .bind(source.to_string_lossy().to_string())
+        .bind("stage-a")
+        .bind("{not-json}")
+        .bind(serde_json::to_string(&sample_fingerprint()).expect("fingerprint json should encode"))
+        .bind(0_i64)
+        .execute(&store.pool)
+        .await
+        .expect("seed row should insert");
+
+        let err = store
+            .load_source_artifacts("task-1", source)
+            .await
+            .expect_err("invalid artifact json must fail");
+        assert_eq!(err.code, "SERDE_ERROR");
+        assert!(err.message.contains("decode_source_artifacts"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_source_artifacts_rejects_invalid_fingerprint_json() {
+        let store = setup_store().await;
+        let source = Path::new("/src/file.txt");
+
+        sqlx::query(
+            "INSERT INTO task_source_artifacts (task_id, source_path, stage_key, artifacts_json, source_fingerprint_json, updated_at_ms) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind("task-1")
+        .bind(source.to_string_lossy().to_string())
+        .bind("stage-a")
+        .bind(serde_json::to_string(&StageArtifacts::new().with_value("k", "v")).expect("artifact json should encode"))
+        .bind("{not-json}")
+        .bind(0_i64)
+        .execute(&store.pool)
+        .await
+        .expect("seed row should insert");
+
+        let err = store
+            .load_source_artifacts("task-1", source)
+            .await
+            .expect_err("invalid fingerprint json must fail");
+        assert_eq!(err.code, "SERDE_ERROR");
+        assert!(err.message.contains("decode_source_fingerprint"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn save_source_artifacts_replaces_existing_stage_rows() {
+        let store = setup_store().await;
+        let source = Path::new("/src/file.txt");
+
+        let mut first = PipelineArtifacts::new();
+        first.insert_stage_output("stage-a", StageArtifacts::new().with_value("value", 1_i64));
+        first.insert_stage_output("stage-b", StageArtifacts::new().with_value("value", 2_i64));
+        store
+            .save_source_artifacts("task-1", source, &sample_fingerprint(), &first)
+            .await
+            .expect("initial save should succeed");
+
+        let mut second = PipelineArtifacts::new();
+        second.insert_stage_output("stage-c", StageArtifacts::new().with_value("value", 3_i64));
+        store
+            .save_source_artifacts("task-1", source, &sample_fingerprint(), &second)
+            .await
+            .expect("replacement save should succeed");
+
+        let loaded = store
+            .load_source_artifacts("task-1", source)
+            .await
+            .expect("load should succeed")
+            .expect("artifacts should exist");
+        assert_eq!(loaded.artifacts.get("stage-a", "value"), None);
+        assert_eq!(loaded.artifacts.get("stage-b", "value"), None);
+        assert_eq!(
+            loaded
+                .artifacts
+                .get("stage-c", "value")
+                .and_then(|value| value.as_i64()),
+            Some(3)
+        );
     }
 }
